@@ -837,7 +837,7 @@ fn run_unarc_extract(
         args.push(format!("-p{pwd}"));
     }
     args.push(archive_path.display().to_string());
-    run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, control, unpack_clock, start_p, end_p)
+    run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, control, job_start, start_p, end_p)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -862,7 +862,7 @@ fn run_7z_extract(
         format!("-o{}", target_game_dir.display()),
         archive_path.display().to_string(),
     ];
-    run_and_stream_logs(seven_zip, &args, None, fast_temp_dir, shared, control, unpack_clock, start_p, end_p)
+    run_and_stream_logs(seven_zip, &args, None, fast_temp_dir, shared, control, job_start, start_p, end_p)
 }
 
 fn resolve_source_file(source_root: &Path, rel_path: &str) -> PathBuf {
