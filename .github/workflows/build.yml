@@ -21,10 +21,18 @@ jobs:
 
       - name: Build 32-bit Native unarc.dll Host & Bundle All Helpers + WinFsp MSI
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path bundled_tools | Out-Null
           New-Item -ItemType Directory -Force -Path _dl | Out-Null
+
+          $ghHeaders = @{
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "User-Agent"    = "ArcSteam-CI"
+            "Accept"        = "application/vnd.github+json"
+          }
 
           # 1. Compile 32-bit LAA unarc_host32.exe using MSVC x86 (in isolated subshell)
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -37,9 +45,9 @@ jobs:
           Copy-Item "C:\Program Files\7-Zip\7z.exe" "bundled_tools\7z.exe" -Force
           Copy-Item "C:\Program Files\7-Zip\7z.dll" "bundled_tools\7z.dll" -Force
 
-          # 3. innoextract (Inno Setup up to 6.7.0, with 1.9 fallback)
+          # 3. innoextract (Inno Setup up to 6.7.0, with official 1.9 fallback)
           try {
-            $rel = Invoke-RestMethod "https://api.github.com/repos/UserUnknownFactor/innoextract_win/releases/latest"
+            $rel = Invoke-RestMethod "https://api.github.com/repos/UserUnknownFactor/innoextract_win/releases/latest" -Headers $ghHeaders
             $asset = $rel.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
             Invoke-WebRequest $asset.browser_download_url -OutFile "_dl\innoextract.zip"
           } catch {
@@ -71,9 +79,13 @@ jobs:
           if ($ua) { Copy-Item $ua.FullName "bundled_tools\unarc.exe" -Force }
 
           # 6. Official signed WinFsp MSI (~2.1 MB) embedded for 1-click built-in install
-          $wfRel = Invoke-RestMethod "https://api.github.com/repos/winfsp/winfsp/releases/latest"
-          $wfMsi = $wfRel.assets | Where-Object { $_.name -like "winfsp-*.msi" } | Select-Object -First 1
-          Invoke-WebRequest $wfMsi.browser_download_url -OutFile "bundled_tools\winfsp.msi"
+          try {
+            $wfRel = Invoke-RestMethod "https://api.github.com/repos/winfsp/winfsp/releases/latest" -Headers $ghHeaders
+            $wfMsi = $wfRel.assets | Where-Object { $_.name -like "winfsp-*.msi" } | Select-Object -First 1
+            Invoke-WebRequest $wfMsi.browser_download_url -OutFile "bundled_tools\winfsp.msi"
+          } catch {
+            Invoke-WebRequest "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile "bundled_tools\winfsp.msi"
+          }
 
           Remove-Item -Recurse -Force _dl
           Write-Host "All bundled binaries ready for embedding:"
