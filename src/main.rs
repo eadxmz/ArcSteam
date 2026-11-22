@@ -13,8 +13,10 @@ mod zstd_pack;
 
 use config::AppConfig;
 use detect::{RepackFileEntry, RepackFormat};
-use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Vec2};
-use optimizer::PeBitness;
+use eframe::egui::{
+    self, Color32, CornerRadius, Frame, Margin, Pos2, Rect, RichText, Sense, Stroke,
+    TextureHandle, TextureOptions, Vec2,
+};
 use pipeline::{JobConfig, PipelineControl, QueueEntry, QueueItemState, SharedTelemetry};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,21 +27,22 @@ use win_sys::PostQueueAction;
 use zstd_pack::ZstdProgress;
 
 const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/icon_rgba.bin");
+const BG_AURA_RGBA: &[u8] = include_bytes!("../assets/bg_aura.bin");
 
-// Obsidian + Electric Purple Palette
-const BG_CANVAS: Color32 = Color32::from_rgb(10, 8, 20);
-const BG_CARD: Color32 = Color32::from_rgb(19, 14, 36);
-const BG_INPUT: Color32 = Color32::from_rgb(26, 20, 48);
-const BG_HOVER: Color32 = Color32::from_rgb(38, 28, 70);
-const BORDER_PURPLE: Color32 = Color32::from_rgb(84, 52, 145);
-const ACCENT_PURPLE: Color32 = Color32::from_rgb(147, 51, 234);
-const ACCENT_VIOLET: Color32 = Color32::from_rgb(168, 85, 247);
-const ACCENT_CYAN: Color32 = Color32::from_rgb(56, 189, 248);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(245, 243, 255);
-const TEXT_MUTED: Color32 = Color32::from_rgb(165, 158, 194);
-const OK_GREEN: Color32 = Color32::from_rgb(52, 211, 153);
-const WARN_AMBER: Color32 = Color32::from_rgb(251, 191, 36);
-const ERR_RED: Color32 = Color32::from_rgb(248, 113, 113);
+// Frosted Lavender-Obsidian Glass Palette (inspired by luminous glass UI)
+const GLASS_CARD_BG: Color32 = Color32::from_rgba_premultiplied(11, 8, 20, 182);
+const GLASS_PILL_BG: Color32 = Color32::from_rgba_premultiplied(9, 6, 17, 212);
+const GLASS_INPUT_BG: Color32 = Color32::from_rgba_premultiplied(8, 5, 15, 195);
+const GLASS_BORDER: Color32 = Color32::from_rgba_premultiplied(55, 51, 60, 60);
+const GLASS_BORDER_SOFT: Color32 = Color32::from_rgba_premultiplied(32, 28, 38, 38);
+const LAVENDER_TEXT: Color32 = Color32::from_rgb(203, 166, 247);
+const LAVENDER_GRAD_L: Color32 = Color32::from_rgb(154, 92, 232);
+const LAVENDER_GRAD_R: Color32 = Color32::from_rgb(218, 186, 252);
+const TEXT_WHITE: Color32 = Color32::from_rgb(248, 246, 255);
+const TEXT_SOFT: Color32 = Color32::from_rgb(184, 174, 212);
+const OK_MINT: Color32 = Color32::from_rgb(74, 222, 128);
+const WARN_GOLD: Color32 = Color32::from_rgb(251, 191, 36);
+const ERR_CORAL: Color32 = Color32::from_rgb(248, 113, 113);
 
 #[derive(PartialEq, Eq)]
 enum MainTab {
@@ -57,37 +60,24 @@ enum SourceKind {
 struct ToolsHealth {
     is_admin: bool,
     winfsp_ok: bool,
-    innounp_ok: bool,
-    unarc_ok: bool,
-    unarc_bitness: PeBitness,
-    innoextract_ok: bool,
-    seven_zip_ok: bool,
-    bundled_count: usize,
+    winfsp_msi_ready: bool,
+    core_ready: bool,
 }
 
 impl ToolsHealth {
     fn probe() -> Self {
-        let unarc_path = embedded_tools::resolve_tool("unarc.exe");
-        let unarc_ok = unarc_path.exists();
-        let unarc_bitness = if unarc_ok {
-            optimizer::inspect_pe_bitness(&unarc_path)
-        } else {
-            PeBitness::Unknown
-        };
+        let core_ready = embedded_tools::resolve_tool("innounp.exe").exists()
+            && (embedded_tools::resolve_tool("unarc_host32.exe").exists()
+                || embedded_tools::resolve_tool("unarc.exe").exists())
+            && embedded_tools::resolve_tool("innoextract.exe").exists()
+            && embedded_tools::resolve_tool("7z.exe").exists();
+
         Self {
             is_admin: win_sys::is_elevated(),
             winfsp_ok: win_sys::is_winfsp_installed(),
-            innounp_ok: embedded_tools::resolve_tool("innounp.exe").exists(),
-            unarc_ok,
-            unarc_bitness,
-            innoextract_ok: embedded_tools::resolve_tool("innoextract.exe").exists(),
-            seven_zip_ok: embedded_tools::resolve_tool("7z.exe").exists(),
-            bundled_count: embedded_tools::embedded_count(),
+            winfsp_msi_ready: embedded_tools::resolve_tool("winfsp.msi").exists(),
+            core_ready,
         }
-    }
-
-    fn core_engines_ready(&self) -> bool {
-        self.innounp_ok && self.unarc_ok && self.innoextract_ok && self.seven_zip_ok
     }
 }
 
@@ -102,8 +92,11 @@ struct ArcSteamApp {
     telemetry: Arc<Mutex<SharedTelemetry>>,
     control: Arc<PipelineControl>,
     health: ToolsHealth,
+    winfsp_installing: Arc<AtomicBool>,
+    show_settings: bool,
     show_logs: bool,
-    // Tools tab state
+    bg_texture: Option<TextureHandle>,
+    // Tools tab
     verify_dir: PathBuf,
     verify_progress: Arc<Mutex<VerifyProgress>>,
     verify_cancel: Arc<AtomicBool>,
@@ -120,15 +113,12 @@ impl Default for ArcSteamApp {
         let cfg = AppConfig::load();
 
         let mut initial_telemetry = SharedTelemetry::default();
-        initial_telemetry.stage_label = "Ready to install".into();
+        initial_telemetry.stage_label = "Ready".into();
         initial_telemetry.eta_text = "--".into();
-        if extracted > 0 {
-            initial_telemetry.log(format!(
-                "[INIT] ArcSteam ready — {extracted} built-in unpack engines verified."
-            ));
-        } else {
-            initial_telemetry.log("[INIT] ArcSteam ready (using local tools/ folder).");
-        }
+        let bundled = embedded_tools::embedded_count();
+        initial_telemetry.log(format!(
+            "[INIT] ArcSteam ready — {extracted}/{bundled} built-in components loaded (native unarc.dll host + WinFsp MSI)."
+        ));
 
         let telemetry = Arc::new(Mutex::new(initial_telemetry));
         let sweep_telemetry = telemetry.clone();
@@ -137,7 +127,7 @@ impl Default for ArcSteamApp {
             if !swept.is_empty() {
                 if let Ok(mut t) = sweep_telemetry.lock() {
                     t.log(format!(
-                        "[RECOVERY] Cleaned up {} leftover Defender rule(s) from prior run.",
+                        "[RECOVERY] Cleaned up {} leftover Defender rule(s).",
                         swept.len()
                     ));
                 }
@@ -159,7 +149,10 @@ impl Default for ArcSteamApp {
             telemetry,
             control: Arc::new(PipelineControl::default()),
             health: ToolsHealth::probe(),
+            winfsp_installing: Arc::new(AtomicBool::new(false)),
+            show_settings: false,
             show_logs: false,
+            bg_texture: None,
             verify_dir,
             verify_progress: Arc::new(Mutex::new(VerifyProgress::default())),
             verify_cancel: Arc::new(AtomicBool::new(false)),
@@ -175,38 +168,152 @@ impl Default for ArcSteamApp {
 impl ArcSteamApp {
     fn configure_theme(ctx: &egui::Context) {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BG_CANVAS;
-        visuals.window_fill = Color32::from_rgb(16, 12, 30);
-        visuals.extreme_bg_color = Color32::from_rgb(14, 10, 26);
+        visuals.panel_fill = Color32::TRANSPARENT;
+        visuals.window_fill = Color32::from_rgb(14, 9, 24);
+        visuals.extreme_bg_color = GLASS_INPUT_BG;
 
-        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-        visuals.widgets.inactive.bg_fill = BG_INPUT;
-        visuals.widgets.inactive.weak_bg_fill = BG_INPUT;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(66, 44, 112));
-        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-        visuals.widgets.inactive.corner_radius = CornerRadius::same(10);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_WHITE);
+        visuals.widgets.inactive.bg_fill = GLASS_INPUT_BG;
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(24, 17, 42, 160);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, GLASS_BORDER_SOFT);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_WHITE);
+        visuals.widgets.inactive.corner_radius = CornerRadius::same(14);
 
-        visuals.widgets.hovered.bg_fill = BG_HOVER;
-        visuals.widgets.hovered.weak_bg_fill = BG_HOVER;
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_VIOLET);
-        visuals.widgets.hovered.corner_radius = CornerRadius::same(10);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgba_unmultiplied(44, 30, 74, 210);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(44, 30, 74, 210);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, LAVENDER_TEXT);
+        visuals.widgets.hovered.corner_radius = CornerRadius::same(14);
 
-        visuals.widgets.active.bg_fill = ACCENT_PURPLE;
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(216, 180, 254));
-        visuals.widgets.active.corner_radius = CornerRadius::same(10);
+        visuals.widgets.active.bg_fill = LAVENDER_GRAD_L;
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, LAVENDER_GRAD_R);
+        visuals.widgets.active.corner_radius = CornerRadius::same(14);
 
-        visuals.selection.bg_fill = ACCENT_PURPLE;
-        visuals.selection.stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(168, 108, 244, 200);
+        visuals.selection.stroke = Stroke::new(1.0, TEXT_WHITE);
 
         ctx.set_visuals(visuals);
     }
 
-    fn glass_card() -> Frame {
-        Frame::new()
-            .fill(BG_CARD)
-            .stroke(Stroke::new(1.0, BORDER_PURPLE))
-            .corner_radius(CornerRadius::same(16))
-            .inner_margin(Margin::same(16))
+    fn ensure_bg_texture(&mut self, ctx: &egui::Context) -> &TextureHandle {
+        self.bg_texture.get_or_insert_with(|| {
+            let img = egui::ColorImage::from_rgba_unmultiplied([320, 240], BG_AURA_RGBA);
+            ctx.load_texture("arcsteam_bg_aura", img, TextureOptions::LINEAR)
+        })
+    }
+
+    /// Paints a true horizontal lavender-to-orchid gradient capsule button (matching the reference CTA pills).
+    fn gradient_pill_button(
+        ui: &mut egui::Ui,
+        label: &str,
+        width: f32,
+        height: f32,
+        enabled: bool,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let painter = ui.painter();
+        let r = (height * 0.5).min(24.0);
+
+        let (c_left, c_right) = if !enabled {
+            (
+                Color32::from_rgba_unmultiplied(64, 48, 92, 160),
+                Color32::from_rgba_unmultiplied(88, 68, 122, 160),
+            )
+        } else if response.is_pointer_button_down_on() {
+            (
+                Color32::from_rgb(134, 72, 214),
+                Color32::from_rgb(198, 162, 242),
+            )
+        } else if response.hovered() {
+            (
+                Color32::from_rgb(168, 108, 244),
+                Color32::from_rgb(232, 206, 255),
+            )
+        } else {
+            (LAVENDER_GRAD_L, LAVENDER_GRAD_R)
+        };
+
+        // Smooth horizontal gradient inside rounded capsule via vertical strips clipped to capsule
+        let steps = 24usize;
+        let step_w = rect.width() / steps as f32;
+        for i in 0..steps {
+            let t = i as f32 / (steps - 1) as f32;
+            let col = Color32::from_rgba_unmultiplied(
+                (c_left.r() as f32 + (c_right.r() as f32 - c_left.r() as f32) * t) as u8,
+                (c_left.g() as f32 + (c_right.g() as f32 - c_left.g() as f32) * t) as u8,
+                (c_left.b() as f32 + (c_right.b() as f32 - c_left.b() as f32) * t) as u8,
+                c_left.a(),
+            );
+            let x0 = rect.left() + i as f32 * step_w;
+            let x1 = if i == steps - 1 { rect.right() } else { x0 + step_w + 1.0 };
+            let cr = CornerRadius {
+                nw: if i == 0 { r as u8 } else { 0 },
+                sw: if i == 0 { r as u8 } else { 0 },
+                ne: if i == steps - 1 { r as u8 } else { 0 },
+                se: if i == steps - 1 { r as u8 } else { 0 },
+            };
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom())),
+                cr,
+                col,
+            );
+        }
+
+        // Subtle luminous glass sheen rim
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(r as u8),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, if enabled { 95 } else { 30 })),
+            egui::StrokeKind::Inside,
+        );
+
+        let txt_col = if enabled {
+            Color32::from_rgb(255, 255, 255)
+        } else {
+            Color32::from_rgb(175, 165, 198)
+        };
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(14.5),
+            txt_col,
+        );
+
+        response
+    }
+
+    fn draw_glass_progress(ui: &mut egui::Ui, dl_pct: f32, unpack_pct: f32, stage: &str, is_torrent: bool) {
+        let desired = Vec2::new(ui.available_width(), 38.0);
+        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let p = ui.painter();
+
+        p.rect_filled(rect, CornerRadius::same(19), GLASS_INPUT_BG);
+        p.rect_stroke(rect, CornerRadius::same(19), Stroke::new(1.0, GLASS_BORDER), egui::StrokeKind::Inside);
+
+        if is_torrent && dl_pct > 0.005 {
+            let mut dl_r = rect;
+            dl_r.set_width((rect.width() * dl_pct.clamp(0.0, 1.0)).max(24.0));
+            p.rect_filled(dl_r, CornerRadius::same(19), Color32::from_rgba_unmultiplied(109, 40, 217, 175));
+        }
+
+        if unpack_pct > 0.005 {
+            let fill_w = (rect.width() * unpack_pct.clamp(0.0, 1.0)).max(24.0);
+            let r_rect = Rect::from_min_size(rect.min, Vec2::new(fill_w, rect.height()));
+            p.rect_filled(r_rect, CornerRadius::same(19), Color32::from_rgba_unmultiplied(168, 108, 244, 215));
+        }
+
+        let label = if is_torrent {
+            format!("DL {:.0}%  •  Install {:.0}%  —  {}", dl_pct * 100.0, unpack_pct * 100.0, stage)
+        } else {
+            format!("{:.0}%  —  {}", unpack_pct * 100.0, stage)
+        };
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            TEXT_WHITE,
+        );
     }
 
     fn scan_local_now(&mut self) {
@@ -224,6 +331,30 @@ impl ArcSteamApp {
                 ));
             }
         }
+    }
+
+    fn trigger_builtin_winfsp_install(&mut self) {
+        if self.winfsp_installing.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let msi = embedded_tools::resolve_tool("winfsp.msi");
+        let flag = self.winfsp_installing.clone();
+        let telemetry = self.telemetry.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut t) = telemetry.lock() {
+                t.log("[WINFSP] Installing built-in WinFsp driver silently (approve UAC prompt if shown)...");
+            }
+            let ok = win_sys::install_embedded_winfsp(&msi);
+            if let Ok(mut t) = telemetry.lock() {
+                if ok {
+                    let _ = winfsp::winfsp_init();
+                    t.log("[WINFSP] Installed cleanly! Live torrent streaming is now ready.");
+                } else {
+                    t.log("[WARN] Built-in WinFsp installation was cancelled or failed.");
+                }
+            }
+            flag.store(false, Ordering::Relaxed);
+        });
     }
 
     fn build_current_job(&self, torrent_mode: bool) -> JobConfig {
@@ -269,123 +400,62 @@ impl ArcSteamApp {
         }
     }
 
-    fn draw_progress_bar(ui: &mut egui::Ui, dl_pct: f32, unpack_pct: f32, stage: &str, is_torrent: bool) {
-        let desired = Vec2::new(ui.available_width(), 28.0);
-        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-        let p = ui.painter();
-
-        p.rect_filled(rect, CornerRadius::same(14), Color32::from_rgb(16, 12, 32));
-        p.rect_stroke(
-            rect,
-            CornerRadius::same(14),
-            Stroke::new(1.0, Color32::from_rgb(76, 48, 130)),
-            egui::StrokeKind::Inside,
-        );
-
-        if is_torrent && dl_pct > 0.001 {
-            let mut dl_rect = rect;
-            dl_rect.set_width((rect.width() * dl_pct.clamp(0.0, 1.0)).max(14.0));
-            p.rect_filled(dl_rect, CornerRadius::same(14), Color32::from_rgb(91, 33, 182));
-        }
-
-        if unpack_pct > 0.001 {
-            let mut un_rect = rect;
-            un_rect.set_width((rect.width() * unpack_pct.clamp(0.0, 1.0)).max(14.0));
-            p.rect_filled(un_rect, CornerRadius::same(14), ACCENT_PURPLE);
-        }
-
-        let label = if is_torrent {
-            format!(
-                "Download {:.0}%   •   Install {:.0}%   —   {}",
-                dl_pct * 100.0,
-                unpack_pct * 100.0,
-                stage
-            )
-        } else {
-            format!("Install {:.0}%   —   {}", unpack_pct * 100.0, stage)
-        };
-        p.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(12.5),
-            Color32::WHITE,
-        );
-    }
-
-    fn draw_status_pill(ui: &mut egui::Ui, label: &str, ok: bool) -> egui::Response {
-        let (bg, fg) = if ok {
-            (Color32::from_rgb(16, 46, 38), OK_GREEN)
-        } else {
-            (Color32::from_rgb(50, 36, 16), WARN_AMBER)
-        };
-        Frame::new()
-            .fill(bg)
-            .corner_radius(CornerRadius::same(9))
-            .inner_margin(Margin::symmetric(8, 3))
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(RichText::new(label).size(11.0).strong().color(fg))
-                        .sense(egui::Sense::click()),
-                )
-            })
-            .inner
-    }
-
-    fn draw_free_badge(ui: &mut egui::Ui, path: &PathBuf, warn_under_gb: u64) {
-        if let Some(free) = win_sys::free_disk_bytes(path) {
-            let color = if free < warn_under_gb * 1024 * 1024 * 1024 {
-                WARN_AMBER
-            } else {
-                OK_GREEN
-            };
-            ui.label(
-                RichText::new(format!("{} free", detect::format_bytes(free)))
-                    .size(11.5)
-                    .color(color),
-            );
-        }
-    }
-
-    fn path_picker_row(
+    fn input_row(
         ui: &mut egui::Ui,
         label: &str,
         path: &mut PathBuf,
         hint: &str,
-        pick_file_filter: Option<(&str, &[&str])>,
+        save_filter: Option<(&str, &[&str])>,
         warn_gb: Option<u64>,
     ) -> bool {
         let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.add_sized([115.0, 22.0], egui::Label::new(RichText::new(label).color(TEXT_MUTED)));
-            let reserve = if warn_gb.is_some() { 185.0 } else { 95.0 };
-            let input_w = (ui.available_width() - reserve).max(200.0);
-            let mut s = path.display().to_string();
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut s)
-                        .hint_text(hint)
-                        .desired_width(input_w),
-                )
-                .changed()
-            {
-                *path = PathBuf::from(s);
-                changed = true;
-            }
-            if ui.button("Browse").clicked() {
-                let picked = if let Some((name, exts)) = pick_file_filter {
-                    rfd::FileDialog::new().add_filter(name, exts).save_file()
-                } else {
-                    rfd::FileDialog::new().pick_folder()
-                };
-                if let Some(p) = picked {
-                    *path = p;
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).size(12.0).color(TEXT_SOFT));
+                if let Some(gb) = warn_gb {
+                    if let Some(free) = win_sys::free_disk_bytes(path) {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let col = if free < gb * 1024 * 1024 * 1024 { WARN_GOLD } else { OK_MINT };
+                            ui.label(
+                                RichText::new(format!("{} free", detect::format_bytes(free)))
+                                    .size(11.0)
+                                    .color(col),
+                            );
+                        });
+                    }
+                }
+            });
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 84.0).max(160.0);
+                let mut s = path.display().to_string();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut s)
+                            .hint_text(hint)
+                            .margin(Margin::symmetric(12, 8))
+                            .desired_width(w),
+                    )
+                    .changed()
+                {
+                    *path = PathBuf::from(s);
                     changed = true;
                 }
-            }
-            if let Some(gb) = warn_gb {
-                Self::draw_free_badge(ui, path, gb);
-            }
+                if ui
+                    .add(egui::Button::new("Browse").min_size(Vec2::new(72.0, 32.0)))
+                    .clicked()
+                {
+                    let picked = if let Some((name, exts)) = save_filter {
+                        rfd::FileDialog::new().add_filter(name, exts).save_file()
+                    } else {
+                        rfd::FileDialog::new().pick_folder()
+                    };
+                    if let Some(p) = picked {
+                        *path = p;
+                        changed = true;
+                    }
+                }
+            });
         });
         changed
     }
@@ -393,7 +463,7 @@ impl ArcSteamApp {
 
 impl eframe::App for ArcSteamApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drag-and-drop folders or .torrent files directly onto the window
+        // Drag-and-drop folders or .torrent files directly onto the glass card
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw
                 .dropped_files
@@ -480,796 +550,736 @@ impl eframe::App for ArcSteamApp {
         if stage_label == "Failed" {
             self.show_logs = true;
         }
-
         if queue_states.len() == self.queue.len() {
             for (entry, st) in self.queue.iter_mut().zip(queue_states.iter()) {
                 entry.state = *st;
             }
         }
 
+        let wf_installing = self.winfsp_installing.load(Ordering::Relaxed);
+        if !wf_installing && !self.health.winfsp_ok && win_sys::is_winfsp_installed() {
+            self.health = ToolsHealth::probe();
+        }
+
         let verify_running = self.verify_progress.lock().unwrap().running;
         let zstd_running = self.zstd_progress.lock().unwrap().running;
-        if running || verify_running || zstd_running {
+        if running || verify_running || zstd_running || wf_installing {
             ui.ctx().request_repaint_after(Duration::from_millis(140));
         }
 
         let mut cfg_dirty = false;
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            // Top Brand Bar with Crisp Purple ArcSteam SVG + Clean 3-Tab Pill Nav
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Image::new(egui::include_image!("../assets/logo.svg"))
-                        .max_size(Vec2::splat(46.0)),
-                );
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("ArcSteam")
-                            .size(23.0)
-                            .strong()
-                            .color(TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        RichText::new("Fast Game Repack Installer & Live Torrent Streamer")
-                            .size(11.5)
-                            .color(TEXT_MUTED),
-                    );
-                });
+        // Paint full-bleed luminous diagonal purple aura background behind everything
+        let screen_rect = ui.max_rect();
+        let bg_id = self.ensure_bg_texture(ui.ctx()).id();
+        ui.painter().image(
+            bg_id,
+            screen_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.tab, MainTab::Tools, "  Tools  ");
-                    let q_label = if self.queue.is_empty() {
-                        "  Queue  ".to_string()
-                    } else {
-                        format!("  Queue ({})  ", self.queue.len())
-                    };
-                    ui.selectable_value(&mut self.tab, MainTab::Queue, q_label);
-                    ui.selectable_value(&mut self.tab, MainTab::Install, "  Install  ");
-                });
-            });
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.inner_margin(Margin::symmetric(24, 18)))
+            .show(ui, |ui| {
+                // ===============================================================
+                // 1. FLOATING TOP GLASS CAPSULE NAVBAR (matching reference top pill)
+                // ===============================================================
+                ui.vertical_centered(|ui| {
+                    Frame::new()
+                        .fill(GLASS_PILL_BG)
+                        .stroke(Stroke::new(1.1, GLASS_BORDER))
+                        .corner_radius(CornerRadius::same(28))
+                        .inner_margin(Margin::symmetric(14, 8))
+                        .show(ui, |ui| {
+                            ui.set_max_width(540.0);
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Image::new(egui::include_image!("../assets/logo.svg"))
+                                        .max_size(Vec2::splat(30.0)),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("ArcSteam")
+                                        .size(15.0)
+                                        .strong()
+                                        .color(TEXT_WHITE),
+                                );
+                                ui.add_space(18.0);
 
-            ui.add_space(10.0);
+                                ui.selectable_value(&mut self.tab, MainTab::Install, "  Install  ");
+                                let q_lbl = if self.queue.is_empty() {
+                                    "  Queue  ".to_string()
+                                } else {
+                                    format!("  Queue ({})  ", self.queue.len())
+                                };
+                                ui.selectable_value(&mut self.tab, MainTab::Queue, q_lbl);
+                                ui.selectable_value(&mut self.tab, MainTab::Tools, "  Tools  ");
 
-            egui::ScrollArea::vertical()
-                .id_salt("main_body_scroll")
-                .max_height((ui.available_height() - 155.0).max(200.0))
-                .show(ui, |ui| {
-                    match self.tab {
-                        MainTab::Install => {
-                            // Step 1: Choose Source (Simple Segmented Switch)
-                            Self::glass_card().show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("1. Select Repack Source")
-                                            .size(14.5)
-                                            .strong()
-                                            .color(TEXT_PRIMARY),
-                                    );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.selectable_value(
-                                            &mut self.source_kind,
-                                            SourceKind::TorrentMagnet,
-                                            "Torrent / Magnet",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.source_kind,
-                                            SourceKind::LocalFolder,
-                                            "Local Folder",
-                                        );
-                                    });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let log_lbl = if self.show_logs { "Logs" } else { "Log" };
+                                    if ui.small_button(log_lbl).clicked() {
+                                        self.show_logs = !self.show_logs;
+                                    }
                                 });
-                                ui.add_space(8.0);
+                            });
+                        });
+                });
 
-                                if self.source_kind == SourceKind::LocalFolder {
-                                    ui.horizontal(|ui| {
-                                        let input_w = (ui.available_width() - 155.0).max(200.0);
-                                        let mut s = self.cfg.local_source.display().to_string();
-                                        if ui
-                                            .add(
-                                                egui::TextEdit::singleline(&mut s)
-                                                    .hint_text("Drop a repack folder anywhere here or click Browse...")
-                                                    .desired_width(input_w),
-                                            )
-                                            .changed()
-                                        {
-                                            self.cfg.local_source = PathBuf::from(s);
-                                            cfg_dirty = true;
-                                        }
-                                        if ui.button("Browse").clicked() {
-                                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                                self.cfg.local_source = p;
-                                                self.scan_local_now();
-                                                cfg_dirty = true;
-                                            }
-                                        }
-                                        if ui.button("Scan").clicked() {
-                                            self.scan_local_now();
-                                        }
-                                    });
+                ui.add_space(16.0);
 
-                                    if !self.scanned_files.is_empty() {
-                                        ui.add_space(6.0);
-                                        let skipped_bytes: u64 = self
-                                            .scanned_files
-                                            .iter()
-                                            .filter(|f| !f.selected)
-                                            .map(|f| f.size_bytes)
-                                            .sum();
-                                        let active_archives = self
-                                            .scanned_files
-                                            .iter()
-                                            .filter(|f| f.is_archive && f.selected)
-                                            .count();
+                // ===============================================================
+                // 2. CENTERED FROSTED-GLASS HERO CARD (glow shines right through)
+                // ===============================================================
+                let card_w = (ui.available_width() - 20.0).clamp(480.0, 680.0);
+                let max_card_h = (ui.available_height() - 56.0).max(260.0);
 
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!("Detected: {}", self.detected_format.badge()))
-                                                    .size(12.0)
-                                                    .strong()
-                                                    .color(ACCENT_VIOLET),
-                                            );
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "•  {active_archives} core packs  •  skipping {} of optional extras",
-                                                    detect::format_bytes(skipped_bytes)
-                                                ))
-                                                .size(11.5)
-                                                .color(TEXT_MUTED),
-                                            );
-                                        });
+                ui.vertical_centered(|ui| {
+                    Frame::new()
+                        .fill(GLASS_CARD_BG)
+                        .stroke(Stroke::new(1.2, GLASS_BORDER))
+                        .corner_radius(CornerRadius::same(28))
+                        .inner_margin(Margin::symmetric(28, 22))
+                        .show(ui, |ui| {
+                            ui.set_width(card_w);
 
-                                        egui::CollapsingHeader::new(
-                                            RichText::new("Customize Included Files & Languages")
-                                                .size(12.0)
-                                                .color(ACCENT_CYAN),
-                                        )
-                                        .default_open(false)
-                                        .show(ui, |ui| {
-                                            egui::ScrollArea::vertical()
-                                                .id_salt("blueprint_scroll")
-                                                .max_height(110.0)
-                                                .show(ui, |ui| {
-                                                    for entry in &mut self.scanned_files {
-                                                        if entry.is_archive {
-                                                            let tag = if entry.is_optional { "  [optional]" } else { "" };
-                                                            let label = format!(
-                                                                "{}  ({}){}",
-                                                                entry.rel_path,
-                                                                detect::format_bytes(entry.size_bytes),
-                                                                tag
+                            egui::ScrollArea::vertical()
+                                .id_salt("hero_card_scroll")
+                                .max_height(max_card_h)
+                                .show(ui, |ui| {
+                                    match self.tab {
+                                        MainTab::Install => {
+                                            // Hero Title (white + lavender accent word like reference)
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(
+                                                    RichText::new("Zero-Wait Repack Engine")
+                                                        .size(12.5)
+                                                        .color(TEXT_SOFT),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space((card_w - 270.0).max(0.0) * 0.5);
+                                                    ui.label(
+                                                        RichText::new("Turbo")
+                                                            .size(32.0)
+                                                            .strong()
+                                                            .color(LAVENDER_TEXT),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new("Installer")
+                                                            .size(32.0)
+                                                            .strong()
+                                                            .color(TEXT_WHITE),
+                                                    );
+                                                });
+                                                ui.add_space(10.0);
+
+                                                // Source Mode Segmented Pill
+                                                Frame::new()
+                                                    .fill(GLASS_INPUT_BG)
+                                                    .stroke(Stroke::new(1.0, GLASS_BORDER_SOFT))
+                                                    .corner_radius(CornerRadius::same(18))
+                                                    .inner_margin(Margin::symmetric(6, 4))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.selectable_value(
+                                                                &mut self.source_kind,
+                                                                SourceKind::LocalFolder,
+                                                                "   Local Folder   ",
                                                             );
-                                                            ui.checkbox(&mut entry.selected, label);
+                                                            ui.selectable_value(
+                                                                &mut self.source_kind,
+                                                                SourceKind::TorrentMagnet,
+                                                                "   Torrent / Magnet   ",
+                                                            );
+                                                        });
+                                                    });
+                                            });
+
+                                            ui.add_space(16.0);
+
+                                            // Source Input
+                                            if self.source_kind == SourceKind::LocalFolder {
+                                                let changed = Self::input_row(
+                                                    ui,
+                                                    "Repack Folder (or drag & drop anywhere)",
+                                                    &mut self.cfg.local_source,
+                                                    "Select a repack folder...",
+                                                    None,
+                                                    None,
+                                                );
+                                                if changed {
+                                                    self.scan_local_now();
+                                                    cfg_dirty = true;
+                                                }
+
+                                                if !self.scanned_files.is_empty() {
+                                                    ui.add_space(6.0);
+                                                    let skipped: u64 = self
+                                                        .scanned_files
+                                                        .iter()
+                                                        .filter(|f| !f.selected)
+                                                        .map(|f| f.size_bytes)
+                                                        .sum();
+                                                    let count = self
+                                                        .scanned_files
+                                                        .iter()
+                                                        .filter(|f| f.is_archive && f.selected)
+                                                        .count();
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new(self.detected_format.badge())
+                                                                .size(12.0)
+                                                                .strong()
+                                                                .color(LAVENDER_TEXT),
+                                                        );
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "•  {count} core files  •  skipping {} optional",
+                                                                detect::format_bytes(skipped)
+                                                            ))
+                                                            .size(11.5)
+                                                            .color(TEXT_SOFT),
+                                                        );
+                                                    });
+
+                                                    egui::CollapsingHeader::new(
+                                                        RichText::new("Select languages & optional packs")
+                                                            .size(11.8)
+                                                            .color(TEXT_SOFT),
+                                                    )
+                                                    .default_open(false)
+                                                    .show(ui, |ui| {
+                                                        egui::ScrollArea::vertical()
+                                                            .id_salt("bp_scroll")
+                                                            .max_height(100.0)
+                                                            .show(ui, |ui| {
+                                                                for entry in &mut self.scanned_files {
+                                                                    if entry.is_archive {
+                                                                        let tag = if entry.is_optional { " [optional]" } else { "" };
+                                                                        ui.checkbox(
+                                                                            &mut entry.selected,
+                                                                            format!(
+                                                                                "{} ({}){}",
+                                                                                entry.rel_path,
+                                                                                detect::format_bytes(entry.size_bytes),
+                                                                                tag
+                                                                            ),
+                                                                        );
+                                                                    }
+                                                                }
+                                                            });
+                                                    });
+                                                }
+                                            } else {
+                                                ui.label(RichText::new("Magnet Link or .torrent File").size(12.0).color(TEXT_SOFT));
+                                                ui.add_space(3.0);
+                                                ui.horizontal(|ui| {
+                                                    let w = (ui.available_width() - 92.0).max(160.0);
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(&mut self.magnet_or_torrent)
+                                                            .hint_text("magnet:?xt=urn:btih:... or drop a .torrent file")
+                                                            .margin(Margin::symmetric(12, 8))
+                                                            .desired_width(w),
+                                                    );
+                                                    if ui
+                                                        .add(egui::Button::new("Browse").min_size(Vec2::new(78.0, 32.0)))
+                                                        .clicked()
+                                                    {
+                                                        if let Some(p) = rfd::FileDialog::new()
+                                                            .add_filter("BitTorrent", &["torrent"])
+                                                            .pick_file()
+                                                        {
+                                                            self.magnet_or_torrent = p.display().to_string();
                                                         }
                                                     }
                                                 });
-                                        });
-                                    }
-                                } else {
-                                    ui.horizontal(|ui| {
-                                        let input_w = (ui.available_width() - 125.0).max(200.0);
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut self.magnet_or_torrent)
-                                                .hint_text("Paste a magnet:? link or drop a .torrent file here...")
-                                                .desired_width(input_w),
-                                        );
-                                        if ui.button("Browse .torrent").clicked() {
-                                            if let Some(p) = rfd::FileDialog::new()
-                                                .add_filter("BitTorrent", &["torrent"])
-                                                .pick_file()
-                                            {
-                                                self.magnet_or_torrent = p.display().to_string();
-                                            }
-                                        }
-                                    });
-                                    ui.add_space(6.0);
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .checkbox(
-                                                &mut self.cfg.live_install_while_dl,
-                                                "Install live while downloading (streams directly via virtual drive)",
-                                            )
-                                            .changed()
-                                        {
-                                            cfg_dirty = true;
-                                        }
-                                        if !self.health.winfsp_ok && self.cfg.live_install_while_dl {
-                                            if ui.small_button("Install WinFsp Driver").clicked() {
-                                                win_sys::open_url("https://winfsp.dev/rel/");
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-
-                            ui.add_space(8.0);
-
-                            // Step 2: Install Destination (Clean, Full-Width)
-                            Self::glass_card().show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("2. Install Destination")
-                                        .size(14.5)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                                ui.add_space(6.0);
-                                if Self::path_picker_row(
-                                    ui,
-                                    "Install Game To:",
-                                    &mut self.cfg.target_game_dir,
-                                    r"C:\Games",
-                                    None,
-                                    Some(25),
-                                ) {
-                                    cfg_dirty = true;
-                                }
-                            });
-
-                            ui.add_space(8.0);
-
-                            // Step 3: Collapsible Turbo Settings (Pre-tuned, clean by default)
-                            Self::glass_card().show(ui, |ui| {
-                                egui::CollapsingHeader::new(
-                                    RichText::new(format!(
-                                        "Turbo Settings  (Auto-Tuned: {} MB RAM • Defender Boost {})",
-                                        self.cfg.srep_ram_mb,
-                                        if self.cfg.defender_bypass { "ON" } else { "OFF" }
-                                    ))
-                                    .size(13.0)
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
-                                )
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    ui.add_space(6.0);
-                                    if Self::path_picker_row(
-                                        ui,
-                                        "Fast Temp Drive:",
-                                        &mut self.cfg.temp_ssd_dir,
-                                        "Pick your fastest SSD for temporary swap files",
-                                        None,
-                                        Some(8),
-                                    ) {
-                                        cfg_dirty = true;
-                                    }
-                                    if self.source_kind == SourceKind::TorrentMagnet {
-                                        ui.add_space(4.0);
-                                        if Self::path_picker_row(
-                                            ui,
-                                            "Download Cache:",
-                                            &mut self.cfg.download_cache_dir,
-                                            "Where torrent pieces are cached",
-                                            None,
-                                            Some(15),
-                                        ) {
-                                            cfg_dirty = true;
-                                        }
-                                    }
-
-                                    ui.add_space(8.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui.checkbox(&mut self.cfg.defender_bypass, "Temporary Defender Boost").changed() {
-                                            cfg_dirty = true;
-                                        }
-                                        if ui.checkbox(&mut self.cfg.replay_registry, "Auto Registry Keys").changed() {
-                                            cfg_dirty = true;
-                                        }
-                                        if ui.checkbox(&mut self.cfg.create_shortcuts, "Desktop Shortcuts").changed() {
-                                            cfg_dirty = true;
-                                        }
-                                        if ui.checkbox(&mut self.cfg.auto_clean_temp, "Clean Temp Files").changed() {
-                                            cfg_dirty = true;
-                                        }
-                                    });
-
-                                    ui.add_space(6.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("Memory Limit (SREP):").color(TEXT_MUTED));
-                                        if ui
-                                            .add(egui::Slider::new(&mut self.cfg.srep_ram_mb, 1024..=12288).suffix(" MB"))
-                                            .changed()
-                                        {
-                                            cfg_dirty = true;
-                                        }
-                                        ui.separator();
-                                        ui.label(RichText::new("Stream Drive:").color(TEXT_MUTED));
-                                        if ui
-                                            .add(egui::TextEdit::singleline(&mut self.cfg.virtual_drive).desired_width(36.0))
-                                            .changed()
-                                        {
-                                            cfg_dirty = true;
-                                        }
-                                    });
-                                });
-                            });
-                        }
-
-                        MainTab::Queue => {
-                            Self::glass_card().show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("Batch Install Queue")
-                                            .size(15.0)
-                                            .strong()
-                                            .color(TEXT_PRIMARY),
-                                    );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui
-                                            .add_enabled(!running && !self.queue.is_empty(), egui::Button::new("Clear"))
-                                            .clicked()
-                                        {
-                                            self.queue.clear();
-                                        }
-                                        if ui.button("+ Add Repack Folder").clicked() {
-                                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                                let (fmt, entries) = detect::scan_local_directory(&p);
-                                                let mut job = self.build_current_job(false);
-                                                job.display_name = p
-                                                    .file_name()
-                                                    .map(|n| n.to_string_lossy().to_string())
-                                                    .unwrap_or_else(|| p.display().to_string());
-                                                job.local_source_dir = p;
-                                                job.detected_format = fmt;
-                                                job.selected_files = entries;
-                                                self.queue.push(QueueEntry {
-                                                    config: job,
-                                                    state: QueueItemState::Queued,
-                                                });
-                                            }
-                                        }
-                                    });
-                                });
-                                ui.add_space(8.0);
-
-                                if self.queue.is_empty() {
-                                    ui.label(
-                                        RichText::new("Drag & drop multiple repack folders onto ArcSteam to install them overnight back-to-back.")
-                                            .color(TEXT_MUTED),
-                                    );
-                                } else {
-                                    let mut remove_idx: Option<usize> = None;
-                                    for (i, item) in self.queue.iter().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            let badge_color = match item.state {
-                                                QueueItemState::Done => OK_GREEN,
-                                                QueueItemState::Running => ACCENT_VIOLET,
-                                                QueueItemState::Failed | QueueItemState::Cancelled => ERR_RED,
-                                                QueueItemState::Queued => TEXT_MUTED,
-                                            };
-                                            ui.label(
-                                                RichText::new(format!("[{}]", item.state.label()))
-                                                    .strong()
-                                                    .color(badge_color),
-                                            );
-                                            ui.label(RichText::new(&item.config.display_name).strong());
-                                            ui.label(
-                                                RichText::new(format!("-> {}", item.config.target_game_dir.display()))
-                                                    .size(11.5)
-                                                    .color(TEXT_MUTED),
-                                            );
-                                            if !running && ui.small_button("Remove").clicked() {
-                                                remove_idx = Some(i);
-                                            }
-                                        });
-                                    }
-                                    if let Some(idx) = remove_idx {
-                                        self.queue.remove(idx);
-                                    }
-                                }
-
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("After Queue Finishes:").color(TEXT_MUTED));
-                                    egui::ComboBox::from_id_salt("post_queue_action")
-                                        .selected_text(self.cfg.post_queue_action.label())
-                                        .show_ui(ui, |ui| {
-                                            for opt in [
-                                                PostQueueAction::DoNothing,
-                                                PostQueueAction::SleepPc,
-                                                PostQueueAction::ShutdownPc,
-                                            ] {
+                                                ui.add_space(6.0);
                                                 if ui
-                                                    .selectable_value(
-                                                        &mut self.cfg.post_queue_action,
-                                                        opt,
-                                                        opt.label(),
+                                                    .checkbox(
+                                                        &mut self.cfg.live_install_while_dl,
+                                                        "Stream & install live while downloading (WinFsp virtual drive)",
                                                     )
                                                     .changed()
                                                 {
                                                     cfg_dirty = true;
                                                 }
                                             }
-                                        });
-                                    ui.label(
-                                        RichText::new("(PC sleep is automatically prevented while installing)")
-                                            .size(11.0)
-                                            .color(TEXT_MUTED),
-                                    );
-                                });
-                            });
-                        }
 
-                        MainTab::Tools => {
-                            // Tool 1: Fast File Integrity Checker (MD5 / SFV)
-                            Self::glass_card().show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Verify Repack Files (Multi-Core MD5 / SFV)")
-                                        .size(14.5)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    let input_w = (ui.available_width() - 185.0).max(200.0);
-                                    let mut s = self.verify_dir.display().to_string();
-                                    if ui
-                                        .add(
-                                            egui::TextEdit::singleline(&mut s)
-                                                .hint_text("Select a repack folder containing MD5 or SFV files...")
-                                                .desired_width(input_w),
-                                        )
-                                        .changed()
-                                    {
-                                        self.verify_dir = PathBuf::from(s);
-                                    }
-                                    if ui.button("Browse").clicked() {
-                                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                            self.verify_dir = p;
-                                        }
-                                    }
-                                    if verify_running {
-                                        if ui.button("Stop").clicked() {
-                                            self.verify_cancel.store(true, Ordering::Relaxed);
-                                        }
-                                    } else if ui.button("Verify Now").clicked() {
-                                        verify::spawn_verify_thread(
-                                            self.verify_dir.clone(),
-                                            self.verify_progress.clone(),
-                                            self.verify_cancel.clone(),
-                                        );
-                                    }
-                                });
+                                            ui.add_space(12.0);
 
-                                let vp = self.verify_progress.lock().unwrap().clone();
-                                if !vp.manifest_found.is_empty() {
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}  •  {}/{} checked  •  OK: {}  Missing: {}  Corrupt: {}",
-                                            vp.manifest_found,
-                                            vp.completed,
-                                            vp.total,
-                                            vp.ok_count,
-                                            vp.missing_count,
-                                            vp.corrupt_count
-                                        ))
-                                        .size(11.8)
-                                        .color(if vp.corrupt_count > 0 || vp.missing_count > 0 {
-                                            ERR_RED
-                                        } else {
-                                            OK_GREEN
-                                        }),
-                                    );
-                                    if !vp.results.is_empty() {
-                                        egui::ScrollArea::vertical()
-                                            .id_salt("verify_scroll")
-                                            .max_height(80.0)
-                                            .show(ui, |ui| {
-                                                for res in &vp.results {
-                                                    match res {
-                                                        FileVerifyOutcome::Ok(f) => {
-                                                            ui.label(RichText::new(format!("[OK] {f}")).monospace().size(11.0).color(OK_GREEN));
-                                                        }
-                                                        FileVerifyOutcome::Missing(f) => {
-                                                            ui.label(RichText::new(format!("[MISSING] {f}")).monospace().size(11.0).color(WARN_AMBER));
-                                                        }
-                                                        FileVerifyOutcome::Corrupt { file, expected, actual } => {
-                                                            ui.label(RichText::new(format!("[CORRUPT] {file} (expected {expected}, got {actual})")).monospace().size(11.0).color(ERR_RED));
+                                            // Destination Input
+                                            if Self::input_row(
+                                                ui,
+                                                "Install Destination",
+                                                &mut self.cfg.target_game_dir,
+                                                r"C:\Games",
+                                                None,
+                                                Some(25),
+                                            ) {
+                                                cfg_dirty = true;
+                                            }
+
+                                            ui.add_space(18.0);
+
+                                            // Primary Gradient Hero Pill OR Live Progress Pill
+                                            let is_torrent_active = self.source_kind == SourceKind::TorrentMagnet;
+                                            if running {
+                                                Self::draw_glass_progress(
+                                                    ui,
+                                                    dl_pct,
+                                                    unpack_pct,
+                                                    &stage_label,
+                                                    is_torrent_active,
+                                                );
+                                                ui.add_space(8.0);
+                                                ui.horizontal(|ui| {
+                                                    let paused = self.control.paused.load(Ordering::Relaxed);
+                                                    if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                                                        let now_p = self.control.toggle_pause();
+                                                        if let Ok(mut t) = self.telemetry.lock() {
+                                                            t.stage_label = if now_p { "Paused".into() } else { "Resumed".into() };
                                                         }
                                                     }
+                                                    if ui
+                                                        .add(
+                                                            egui::Button::new(RichText::new("Cancel").color(TEXT_WHITE))
+                                                                .fill(Color32::from_rgb(190, 36, 48)),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.control.request_cancel();
+                                                    }
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        let worker_txt = if active_worker.is_empty() { "Working" } else { &active_worker };
+                                                        let q_pre = match active_q_idx {
+                                                            Some(i) if queue_states.len() > 1 => format!("Job {}/{} • ", i + 1, queue_states.len()),
+                                                            _ => String::new(),
+                                                        };
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "{q_pre}{worker_txt} • {worker_ram} MB • {write_mbps:.0} MB/s • DL {dl_mbps:.1} MB/s • ETA {eta_text}"
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(TEXT_SOFT),
+                                                        );
+                                                    });
+                                                });
+                                            } else {
+                                                let has_input = if is_torrent_active {
+                                                    !self.magnet_or_torrent.trim().is_empty()
+                                                } else {
+                                                    !self.cfg.local_source.as_os_str().is_empty()
+                                                };
+                                                let cta_text = if is_torrent_active {
+                                                    "Stream & Install Now   >"
+                                                } else {
+                                                    "Install Now   >"
+                                                };
+                                                let cta_w = ui.available_width();
+                                                if Self::gradient_pill_button(ui, cta_text, cta_w, 46.0, has_input)
+                                                    .clicked()
+                                                    && has_input
+                                                {
+                                                    self.cfg.save();
+                                                    let j = self.build_current_job(is_torrent_active);
+                                                    self.queue = vec![QueueEntry {
+                                                        config: j.clone(),
+                                                        state: QueueItemState::Queued,
+                                                    }];
+                                                    pipeline::spawn_queue_thread(
+                                                        vec![j],
+                                                        self.cfg.post_queue_action,
+                                                        self.telemetry.clone(),
+                                                        self.control.clone(),
+                                                    );
+                                                }
+
+                                                ui.add_space(10.0);
+                                                ui.horizontal(|ui| {
+                                                    if ui.add_enabled(has_input, egui::Button::new("+ Add to Queue")).clicked() {
+                                                        let j = self.build_current_job(is_torrent_active);
+                                                        self.queue.push(QueueEntry {
+                                                            config: j,
+                                                            state: QueueItemState::Queued,
+                                                        });
+                                                    }
+                                                    if unpack_pct >= 0.999 && self.cfg.target_game_dir.exists() {
+                                                        if ui.button("Open Game Folder").clicked() {
+                                                            win_sys::open_in_explorer(&self.cfg.target_game_dir);
+                                                        }
+                                                    }
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        let s_lbl = if self.show_settings { "Hide Turbo Settings" } else { "Turbo Settings" };
+                                                        if ui.button(s_lbl).clicked() {
+                                                            self.show_settings = !self.show_settings;
+                                                        }
+                                                    });
+                                                });
+                                            }
+
+                                            // Collapsible Turbo Settings Drawer
+                                            if self.show_settings {
+                                                ui.add_space(10.0);
+                                                ui.separator();
+                                                ui.add_space(8.0);
+                                                if Self::input_row(
+                                                    ui,
+                                                    "Fast SSD Temp / Swap Folder",
+                                                    &mut self.cfg.temp_ssd_dir,
+                                                    "Fastest SSD partition",
+                                                    None,
+                                                    Some(8),
+                                                ) {
+                                                    cfg_dirty = true;
+                                                }
+                                                if self.source_kind == SourceKind::TorrentMagnet {
+                                                    ui.add_space(6.0);
+                                                    if Self::input_row(
+                                                        ui,
+                                                        "Torrent Cache Folder",
+                                                        &mut self.cfg.download_cache_dir,
+                                                        "Torrent piece storage",
+                                                        None,
+                                                        Some(15),
+                                                    ) {
+                                                        cfg_dirty = true;
+                                                    }
+                                                }
+                                                ui.add_space(8.0);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    if ui.checkbox(&mut self.cfg.defender_bypass, "Defender Boost").changed() { cfg_dirty = true; }
+                                                    if ui.checkbox(&mut self.cfg.replay_registry, "Auto Registry").changed() { cfg_dirty = true; }
+                                                    if ui.checkbox(&mut self.cfg.create_shortcuts, "Desktop Shortcuts").changed() { cfg_dirty = true; }
+                                                    if ui.checkbox(&mut self.cfg.auto_clean_temp, "Clean Temp").changed() { cfg_dirty = true; }
+                                                });
+                                                ui.add_space(6.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.label(RichText::new("SREP Memory:").size(12.0).color(TEXT_SOFT));
+                                                    if ui.add(egui::Slider::new(&mut self.cfg.srep_ram_mb, 1024..=12288).suffix(" MB")).changed() {
+                                                        cfg_dirty = true;
+                                                    }
+                                                    ui.separator();
+                                                    ui.label(RichText::new("Drive:").size(12.0).color(TEXT_SOFT));
+                                                    if ui.add(egui::TextEdit::singleline(&mut self.cfg.virtual_drive).desired_width(34.0)).changed() {
+                                                        cfg_dirty = true;
+                                                    }
+                                                });
+                                            }
+                                        }
+
+                                        MainTab::Queue => {
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(RichText::new("Unattended Overnight Mode").size(12.0).color(TEXT_SOFT));
+                                                ui.label(RichText::new("Batch Queue").size(28.0).strong().color(LAVENDER_TEXT));
+                                            });
+                                            ui.add_space(10.0);
+
+                                            ui.horizontal(|ui| {
+                                                if ui.button("+ Add Repack Folder").clicked() {
+                                                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                                        let (fmt, entries) = detect::scan_local_directory(&p);
+                                                        let mut job = self.build_current_job(false);
+                                                        job.display_name = p
+                                                            .file_name()
+                                                            .map(|n| n.to_string_lossy().to_string())
+                                                            .unwrap_or_else(|| p.display().to_string());
+                                                        job.local_source_dir = p;
+                                                        job.detected_format = fmt;
+                                                        job.selected_files = entries;
+                                                        self.queue.push(QueueEntry {
+                                                            config: job,
+                                                            state: QueueItemState::Queued,
+                                                        });
+                                                    }
+                                                }
+                                                if ui.add_enabled(!running && !self.queue.is_empty(), egui::Button::new("Clear")).clicked() {
+                                                    self.queue.clear();
+                                                }
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    egui::ComboBox::from_id_salt("post_q_act")
+                                                        .selected_text(self.cfg.post_queue_action.label())
+                                                        .show_ui(ui, |ui| {
+                                                            for opt in [
+                                                                PostQueueAction::DoNothing,
+                                                                PostQueueAction::SleepPc,
+                                                                PostQueueAction::ShutdownPc,
+                                                            ] {
+                                                                if ui.selectable_value(&mut self.cfg.post_queue_action, opt, opt.label()).changed() {
+                                                                    cfg_dirty = true;
+                                                                }
+                                                            }
+                                                        });
+                                                    ui.label(RichText::new("When done:").size(12.0).color(TEXT_SOFT));
+                                                });
+                                            });
+
+                                            ui.add_space(10.0);
+                                            if self.queue.is_empty() {
+                                                ui.vertical_centered(|ui| {
+                                                    ui.add_space(20.0);
+                                                    ui.label(RichText::new("Drop multiple repack folders onto ArcSteam to queue them.").color(TEXT_SOFT));
+                                                    ui.add_space(20.0);
+                                                });
+                                            } else {
+                                                let mut remove_idx: Option<usize> = None;
+                                                for (i, item) in self.queue.iter().enumerate() {
+                                                    ui.horizontal(|ui| {
+                                                        let col = match item.state {
+                                                            QueueItemState::Done => OK_MINT,
+                                                            QueueItemState::Running => LAVENDER_TEXT,
+                                                            QueueItemState::Failed | QueueItemState::Cancelled => ERR_CORAL,
+                                                            QueueItemState::Queued => TEXT_SOFT,
+                                                        };
+                                                        ui.label(RichText::new(format!("[{}]", item.state.label())).strong().color(col));
+                                                        ui.label(RichText::new(&item.config.display_name).strong().color(TEXT_WHITE));
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            if !running && ui.small_button("Remove").clicked() {
+                                                                remove_idx = Some(i);
+                                                            }
+                                                        });
+                                                    });
+                                                }
+                                                if let Some(idx) = remove_idx {
+                                                    self.queue.remove(idx);
+                                                }
+                                            }
+
+                                            ui.add_space(14.0);
+                                            if running {
+                                                Self::draw_glass_progress(ui, dl_pct, unpack_pct, &stage_label, false);
+                                            } else {
+                                                let can_q = !self.queue.is_empty();
+                                                let w = ui.available_width();
+                                                if Self::gradient_pill_button(ui, "Start Batch Queue   >", w, 44.0, can_q)
+                                                    .clicked()
+                                                    && can_q
+                                                {
+                                                    self.cfg.save();
+                                                    let jobs: Vec<JobConfig> = self.queue.iter().map(|q| q.config.clone()).collect();
+                                                    pipeline::spawn_queue_thread(
+                                                        jobs,
+                                                        self.cfg.post_queue_action,
+                                                        self.telemetry.clone(),
+                                                        self.control.clone(),
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        MainTab::Tools => {
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(RichText::new("Verify & Fast Backup").size(12.0).color(TEXT_SOFT));
+                                                ui.label(RichText::new("Repack Tools").size(28.0).strong().color(LAVENDER_TEXT));
+                                            });
+                                            ui.add_space(12.0);
+
+                                            // MD5 / SFV Verifier
+                                            Self::input_row(
+                                                ui,
+                                                "Multi-Core MD5 / SFV File Verifier",
+                                                &mut self.verify_dir,
+                                                "Select a repack folder...",
+                                                None,
+                                                None,
+                                            );
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                if verify_running {
+                                                    if ui.button("Stop Verification").clicked() {
+                                                        self.verify_cancel.store(true, Ordering::Relaxed);
+                                                    }
+                                                } else if ui.button("Verify Files Now").clicked() {
+                                                    verify::spawn_verify_thread(
+                                                        self.verify_dir.clone(),
+                                                        self.verify_progress.clone(),
+                                                        self.verify_cancel.clone(),
+                                                    );
+                                                }
+                                                let vp = self.verify_progress.lock().unwrap().clone();
+                                                if !vp.manifest_found.is_empty() {
+                                                    let col = if vp.corrupt_count > 0 || vp.missing_count > 0 { ERR_CORAL } else { OK_MINT };
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{}/{} checked • OK {} • Missing {} • Corrupt {}",
+                                                            vp.completed, vp.total, vp.ok_count, vp.missing_count, vp.corrupt_count
+                                                        ))
+                                                        .size(11.5)
+                                                        .color(col),
+                                                    );
+                                                }
+                                            });
+                                            let vp_res = self.verify_progress.lock().unwrap().results.clone();
+                                            if !vp_res.is_empty() {
+                                                egui::ScrollArea::vertical().id_salt("v_res").max_height(70.0).show(ui, |ui| {
+                                                    for r in &vp_res {
+                                                        match r {
+                                                            FileVerifyOutcome::Ok(f) => {
+                                                                ui.label(RichText::new(format!("[OK] {f}")).monospace().size(10.8).color(OK_MINT));
+                                                            }
+                                                            FileVerifyOutcome::Missing(f) => {
+                                                                ui.label(RichText::new(format!("[MISSING] {f}")).monospace().size(10.8).color(WARN_GOLD));
+                                                            }
+                                                            FileVerifyOutcome::Corrupt { file, expected, actual } => {
+                                                                ui.label(RichText::new(format!("[CORRUPT] {file} ({expected} != {actual})")).monospace().size(10.8).color(ERR_CORAL));
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            }
+
+                                            ui.add_space(12.0);
+                                            ui.separator();
+                                            ui.add_space(10.0);
+
+                                            // Zstd Fast-Archive
+                                            Self::input_row(
+                                                ui,
+                                                "Zstd Fast-Archive — Game Folder",
+                                                &mut self.zstd_src,
+                                                r"C:\Games\MyGame",
+                                                None,
+                                                None,
+                                            );
+                                            ui.add_space(6.0);
+                                            Self::input_row(
+                                                ui,
+                                                "Zstd Backup File (.tar.zst — 500+ MB/s extract)",
+                                                &mut self.zstd_dst,
+                                                "Choose .tar.zst archive path",
+                                                Some(("Zstd Tar", &["zst"])),
+                                                None,
+                                            );
+                                            ui.add_space(8.0);
+                                            let zp = self.zstd_progress.lock().unwrap().clone();
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new("Level:").size(12.0).color(TEXT_SOFT));
+                                                ui.add(egui::Slider::new(&mut self.zstd_level, 1..=12));
+                                                if ui.add_enabled(!zstd_running, egui::Button::new("Pack")).clicked() {
+                                                    zstd_pack::spawn_zstd_pack(
+                                                        self.zstd_src.clone(),
+                                                        self.zstd_dst.clone(),
+                                                        self.zstd_level,
+                                                        self.zstd_progress.clone(),
+                                                        self.zstd_cancel.clone(),
+                                                    );
+                                                }
+                                                if ui.add_enabled(!zstd_running, egui::Button::new("Unpack")).clicked() {
+                                                    zstd_pack::spawn_zstd_unpack(
+                                                        self.zstd_dst.clone(),
+                                                        self.zstd_src.clone(),
+                                                        self.zstd_progress.clone(),
+                                                        self.zstd_cancel.clone(),
+                                                    );
+                                                }
+                                                if zstd_running && ui.button("Cancel").clicked() {
+                                                    self.zstd_cancel.store(true, Ordering::Relaxed);
+                                                }
+                                            });
+                                            if !zp.status.is_empty() {
+                                                ui.add_space(6.0);
+                                                ui.add(egui::ProgressBar::new(zp.pct).text(zp.status));
+                                            }
+                                        }
+                                    }
+
+                                    // Inline Activity Log drawer when toggled or on error
+                                    if self.show_logs {
+                                        ui.add_space(12.0);
+                                        ui.separator();
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new("Activity Log").size(12.0).strong().color(TEXT_WHITE));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("Copy").clicked() {
+                                                    ui.ctx().copy_text(logs_snapshot.join("\n"));
+                                                }
+                                            });
+                                        });
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("glass_log_scroll")
+                                            .max_height(115.0)
+                                            .stick_to_bottom(true)
+                                            .show(ui, |ui| {
+                                                for line in &logs_snapshot {
+                                                    let col = if line.contains("[ERROR]") || line.contains("ERROR:") {
+                                                        ERR_CORAL
+                                                    } else if line.contains("[WARN]") {
+                                                        WARN_GOLD
+                                                    } else if line.contains("[DONE]") {
+                                                        OK_MINT
+                                                    } else {
+                                                        TEXT_SOFT
+                                                    };
+                                                    ui.label(RichText::new(line).monospace().size(10.8).color(col));
                                                 }
                                             });
                                     }
-                                }
-                            });
-
-                            ui.add_space(8.0);
-
-                            // Tool 2: Fast Game Backup (.tar.zst)
-                            Self::glass_card().show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Fast Game Backup (.tar.zst — Unpacks at 500+ MB/s)")
-                                        .size(14.5)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                                ui.add_space(6.0);
-                                Self::path_picker_row(
-                                    ui,
-                                    "Game Folder:",
-                                    &mut self.zstd_src,
-                                    r"C:\Games\MyGame",
-                                    None,
-                                    None,
-                                );
-                                ui.add_space(4.0);
-                                Self::path_picker_row(
-                                    ui,
-                                    "Backup Archive:",
-                                    &mut self.zstd_dst,
-                                    "Choose .tar.zst output file",
-                                    Some(("Zstd Archive", &["zst"])),
-                                    None,
-                                );
-
-                                ui.add_space(8.0);
-                                let zp = self.zstd_progress.lock().unwrap().clone();
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Compression:").color(TEXT_MUTED));
-                                    ui.add(egui::Slider::new(&mut self.zstd_level, 1..=12));
-                                    if ui
-                                        .add_enabled(!zstd_running, egui::Button::new("Pack Folder"))
-                                        .clicked()
-                                    {
-                                        zstd_pack::spawn_zstd_pack(
-                                            self.zstd_src.clone(),
-                                            self.zstd_dst.clone(),
-                                            self.zstd_level,
-                                            self.zstd_progress.clone(),
-                                            self.zstd_cancel.clone(),
-                                        );
-                                    }
-                                    if ui
-                                        .add_enabled(!zstd_running, egui::Button::new("Unpack Archive"))
-                                        .clicked()
-                                    {
-                                        zstd_pack::spawn_zstd_unpack(
-                                            self.zstd_dst.clone(),
-                                            self.zstd_src.clone(),
-                                            self.zstd_progress.clone(),
-                                            self.zstd_cancel.clone(),
-                                        );
-                                    }
-                                    if zstd_running && ui.button("Cancel").clicked() {
-                                        self.zstd_cancel.store(true, Ordering::Relaxed);
-                                    }
                                 });
-                                if !zp.status.is_empty() {
-                                    ui.add_space(6.0);
-                                    ui.add(egui::ProgressBar::new(zp.pct).text(zp.status));
-                                }
-                            });
-                        }
-                    }
+                        });
+                });
 
-                    // Collapsible Activity Log inside scroll area when expanded
-                    if self.show_logs {
-                        ui.add_space(8.0);
-                        Self::glass_card().show(ui, |ui| {
+                ui.add_space(12.0);
+
+                // ===============================================================
+                // 3. FLOATING BOTTOM STATUS CAPSULE (matching reference bottom pill)
+                // ===============================================================
+                ui.vertical_centered(|ui| {
+                    Frame::new()
+                        .fill(GLASS_PILL_BG)
+                        .stroke(Stroke::new(1.0, GLASS_BORDER))
+                        .corner_radius(CornerRadius::same(20))
+                        .inner_margin(Margin::symmetric(16, 6))
+                        .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("Activity Log").strong().color(TEXT_PRIMARY));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("Copy Log").clicked() {
-                                        ui.ctx().copy_text(logs_snapshot.join("\n"));
+                                ui.label(
+                                    RichText::new(if self.health.core_ready {
+                                        "● All Engines Built-in"
+                                    } else {
+                                        "● Missing Engine"
+                                    })
+                                    .size(11.5)
+                                    .color(if self.health.core_ready { OK_MINT } else { WARN_GOLD }),
+                                );
+
+                                ui.label(RichText::new("•").color(TEXT_SOFT));
+
+                                if self.health.winfsp_ok {
+                                    ui.label(RichText::new("● Live Stream Ready").size(11.5).color(OK_MINT));
+                                } else if wf_installing {
+                                    ui.label(RichText::new("Installing WinFsp...").size(11.5).color(LAVENDER_TEXT));
+                                } else if self.health.winfsp_msi_ready {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("Install Built-in WinFsp >")
+                                                    .size(11.5)
+                                                    .strong()
+                                                    .color(TEXT_WHITE),
+                                            )
+                                            .fill(LAVENDER_GRAD_L)
+                                            .corner_radius(CornerRadius::same(12)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.trigger_builtin_winfsp_install();
                                     }
-                                });
-                            });
-                            ui.add_space(4.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("console_log")
-                                .max_height(130.0)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    for line in &logs_snapshot {
-                                        let color = if line.contains("[ERROR]") {
-                                            ERR_RED
-                                        } else if line.contains("[WARN]") {
-                                            WARN_AMBER
-                                        } else if line.contains("[DONE]") {
-                                            OK_GREEN
-                                        } else {
-                                            TEXT_MUTED
-                                        };
-                                        ui.label(RichText::new(line).monospace().size(11.0).color(color));
-                                    }
-                                });
-                        });
-                    }
-                });
-
-            ui.add_space(8.0);
-
-            // Bottom Action & Progress Dock
-            Self::glass_card().show(ui, |ui| {
-                let is_torrent_active = self.source_kind == SourceKind::TorrentMagnet;
-                Self::draw_progress_bar(ui, dl_pct, unpack_pct, &stage_label, is_torrent_active);
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    let is_queue_tab = self.tab == MainTab::Queue;
-                    let btn_text = if running {
-                        "   Installing...   "
-                    } else if is_queue_tab {
-                        "   Start Queue   "
-                    } else if is_torrent_active {
-                        "   Stream & Install   "
-                    } else {
-                        "   Install Now   "
-                    };
-
-                    let has_input = if is_queue_tab {
-                        !self.queue.is_empty()
-                    } else if is_torrent_active {
-                        !self.magnet_or_torrent.trim().is_empty()
-                    } else {
-                        !self.cfg.local_source.as_os_str().is_empty()
-                    };
-                    let can_start = !running && has_input;
-
-                    let launch = egui::Button::new(
-                        RichText::new(btn_text)
-                            .size(13.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(if can_start {
-                        ACCENT_PURPLE
-                    } else {
-                        Color32::from_rgb(56, 46, 84)
-                    })
-                    .corner_radius(CornerRadius::same(11))
-                    .min_size(Vec2::new(140.0, 32.0));
-
-                    if ui.add_enabled(can_start, launch).clicked() {
-                        self.cfg.save();
-                        let jobs: Vec<JobConfig> = if is_queue_tab {
-                            self.queue.iter().map(|q| q.config.clone()).collect()
-                        } else {
-                            let j = self.build_current_job(is_torrent_active);
-                            self.queue = vec![QueueEntry {
-                                config: j.clone(),
-                                state: QueueItemState::Queued,
-                            }];
-                            vec![j]
-                        };
-                        pipeline::spawn_queue_thread(
-                            jobs,
-                            self.cfg.post_queue_action,
-                            self.telemetry.clone(),
-                            self.control.clone(),
-                        );
-                    }
-
-                    if self.tab == MainTab::Install
-                        && ui.add_enabled(can_start, egui::Button::new("+ Queue")).clicked()
-                    {
-                        let j = self.build_current_job(is_torrent_active);
-                        self.queue.push(QueueEntry {
-                            config: j,
-                            state: QueueItemState::Queued,
-                        });
-                    }
-
-                    if !running && unpack_pct >= 0.999 && self.cfg.target_game_dir.exists() {
-                        if ui.button("Open Game Folder").clicked() {
-                            win_sys::open_in_explorer(&self.cfg.target_game_dir);
-                        }
-                    }
-
-                    if running {
-                        let paused = self.control.paused.load(Ordering::Relaxed);
-                        if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
-                            let now_paused = self.control.toggle_pause();
-                            if let Ok(mut t) = self.telemetry.lock() {
-                                t.stage_label = if now_paused {
-                                    "Paused".into()
-                                } else {
-                                    "Resumed".into()
-                                };
-                            }
-                        }
-
-                        let cancel_btn = egui::Button::new(
-                            RichText::new("Cancel").strong().color(Color32::WHITE),
-                        )
-                        .fill(Color32::from_rgb(220, 38, 38))
-                        .corner_radius(CornerRadius::same(10));
-                        if ui.add(cancel_btn).clicked() {
-                            self.control.request_cancel();
-                        }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let log_btn = if self.show_logs { "Hide Logs" } else { "Show Logs" };
-                        if ui.button(log_btn).clicked() {
-                            self.show_logs = !self.show_logs;
-                        }
-                        if running || !active_worker.is_empty() {
-                            let q_prefix = match active_q_idx {
-                                Some(i) if queue_states.len() > 1 => {
-                                    format!("Job {}/{} • ", i + 1, queue_states.len())
+                                } else if ui.small_button("Get WinFsp >").clicked() {
+                                    win_sys::open_url("https://winfsp.dev/rel/");
                                 }
-                                _ => String::new(),
-                            };
-                            let worker_txt = if active_worker.is_empty() {
-                                "Working"
-                            } else {
-                                &active_worker
-                            };
-                            ui.label(
-                                RichText::new(format!(
-                                    "{q_prefix}{worker_txt} • {worker_ram} MB RAM • {write_mbps:.0} MB/s • DL {dl_mbps:.1} MB/s • ETA {eta_text}"
-                                ))
-                                .size(11.0)
-                                .color(TEXT_MUTED),
-                            );
-                        }
-                    });
+
+                                ui.label(RichText::new("•").color(TEXT_SOFT));
+
+                                if self.health.is_admin {
+                                    ui.label(RichText::new("● Admin").size(11.5).color(OK_MINT));
+                                } else if ui.small_button("Run as Admin").clicked() {
+                                    if win_sys::relaunch_as_admin() {
+                                        std::process::exit(0);
+                                    }
+                                }
+                            });
+                        });
                 });
             });
-
-            ui.add_space(5.0);
-
-            // Minimal Clean Status Footer
-            ui.horizontal(|ui| {
-                let engine_txt = if self.health.core_engines_ready() {
-                    if self.health.bundled_count > 0 {
-                        "Engines: Built-in Ready"
-                    } else {
-                        "Engines: Ready"
-                    }
-                } else {
-                    "Engines: Missing Helper"
-                };
-                Self::draw_status_pill(ui, engine_txt, self.health.core_engines_ready());
-
-                let unarc_lbl = match self.health.unarc_bitness {
-                    PeBitness::Bit64 => "FreeArc x64",
-                    PeBitness::Bit32Laa => "FreeArc LAA",
-                    PeBitness::Bit32 => "FreeArc x86",
-                    PeBitness::Unknown => "FreeArc",
-                };
-                if self.health.unarc_ok {
-                    Self::draw_status_pill(ui, unarc_lbl, true);
-                }
-
-                if Self::draw_status_pill(
-                    ui,
-                    if self.health.winfsp_ok {
-                        "Live Stream: Ready"
-                    } else {
-                        "WinFsp Needed for Live Torrent"
-                    },
-                    self.health.winfsp_ok,
-                )
-                .clicked()
-                    && !self.health.winfsp_ok
-                {
-                    win_sys::open_url("https://winfsp.dev/rel/");
-                }
-
-                Self::draw_status_pill(
-                    ui,
-                    if self.health.is_admin {
-                        "Admin"
-                    } else {
-                        "Standard Mode"
-                    },
-                    self.health.is_admin,
-                );
-                if !self.health.is_admin && ui.small_button("Run as Admin").clicked() {
-                    if win_sys::relaunch_as_admin() {
-                        std::process::exit(0);
-                    }
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Refresh").clicked() {
-                        self.health = ToolsHealth::probe();
-                    }
-                });
-            });
-        });
 
         if cfg_dirty {
             self.cfg.save();
@@ -1290,8 +1300,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 660.0])
-            .with_min_inner_size([740.0, 560.0])
+            .with_inner_size([840.0, 680.0])
+            .with_min_inner_size([660.0, 560.0])
             .with_drag_and_drop(true)
             .with_icon(load_app_icon()),
         ..Default::default()

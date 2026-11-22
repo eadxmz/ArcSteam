@@ -9,7 +9,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Default, Clone)]
 pub struct DissectedSetup {
-    pub work_dir: PathBuf,
     pub archive_password: Option<String>,
     pub registry_entries: Vec<RegistryEntry>,
     pub icon_entries: Vec<IconEntry>,
@@ -59,24 +58,44 @@ pub fn dissect_inno_setup(
         .output()
         .with_context(|| format!("Failed to invoke innounp at {}", innounp_exe.display()))?;
 
-    let mut result = DissectedSetup {
-        work_dir: work_dir.to_path_buf(),
-        ..Default::default()
-    };
+    let mut result = DissectedSetup::default();
 
     if !out.status.success() {
         return Ok(result);
     }
 
-    let tmp_sub = work_dir.join("{tmp}");
-    if tmp_sub.is_dir() {
-        for entry in walkdir::WalkDir::new(&tmp_sub).into_iter().flatten() {
-            if entry.file_type().is_file() {
-                let src = entry.path();
-                if let Some(name) = src.file_name() {
-                    let _ = fs::copy(src, work_dir.join(name));
-                }
-            }
+    for entry in walkdir::WalkDir::new(work_dir).max_depth(4).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let src = entry.path();
+        if src.parent() == Some(work_dir) {
+            continue;
+        }
+        let Some(name_os) = src.file_name() else { continue };
+        let lower = name_os.to_string_lossy().to_ascii_lowercase();
+        let in_tmp = src
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("{tmp}");
+        let is_plugin = lower == "unarc.dll"
+            || lower == "arc.ini"
+            || lower == "cls.ini"
+            || lower.starts_with("cls-")
+            || lower.starts_with("srep")
+            || lower.starts_with("lolz")
+            || lower.starts_with("xtool")
+            || lower.starts_with("oo2core")
+            || lower.starts_with("facompress")
+            || lower.starts_with("zlib")
+            || lower.starts_with("rz");
+        if in_tmp || is_plugin {
+            let dst_name = if lower == "unarc.dll" {
+                std::ffi::OsStr::new("unarc.dll")
+            } else {
+                name_os
+            };
+            let _ = fs::copy(src, work_dir.join(dst_name));
         }
     }
 

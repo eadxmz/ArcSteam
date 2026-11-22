@@ -19,18 +19,25 @@ jobs:
         shell: pwsh
         run: choco install winfsp -y --install-arguments="ADDLOCAL=ALL"
 
-      - name: Bundle Helper Binaries (Single-EXE Standalone Packaging)
+      - name: Build 32-bit Native unarc.dll Host & Bundle All Helpers + WinFsp MSI
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path bundled_tools | Out-Null
           New-Item -ItemType Directory -Force -Path _dl | Out-Null
 
-          # 1. 7-Zip CLI (preinstalled on windows-latest)
+          # 1. Compile 32-bit LAA unarc_host32.exe using MSVC x86 (in isolated subshell)
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars32 = Join-Path $vsPath "VC\Auxiliary\Build\vcvars32.bat"
+          cmd.exe /c "`"$vcvars32`" && cl.exe /nologo /O2 /MT tools_src\unarc_host32.c /Fe:bundled_tools\unarc_host32.exe /link /LARGEADDRESSAWARE"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to compile unarc_host32.exe" }
+
+          # 2. 7-Zip CLI (preinstalled on windows-latest)
           Copy-Item "C:\Program Files\7-Zip\7z.exe" "bundled_tools\7z.exe" -Force
           Copy-Item "C:\Program Files\7-Zip\7z.dll" "bundled_tools\7z.dll" -Force
 
-          # 2. innoextract (Inno Setup up to 6.7.0, with official 1.9 fallback)
+          # 3. innoextract (Inno Setup up to 6.7.0, with 1.9 fallback)
           try {
             $rel = Invoke-RestMethod "https://api.github.com/repos/UserUnknownFactor/innoextract_win/releases/latest"
             $asset = $rel.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
@@ -42,7 +49,7 @@ jobs:
           $inno = Get-ChildItem "_dl\innoextract" -Recurse -Filter "innoextract.exe" | Select-Object -First 1
           Copy-Item $inno.FullName "bundled_tools\innoextract.exe" -Force
 
-          # 3. innounp-2 (Inno Setup up to 7.1.1, with v0.50 fallback)
+          # 4. innounp-2 (Inno Setup up to 7.1.1, with v0.50 fallback)
           try {
             Invoke-WebRequest "https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/master/innounp-2/innounp-2.zip" -OutFile "_dl\innounp.zip"
             Expand-Archive "_dl\innounp.zip" -DestinationPath "_dl\innounp" -Force
@@ -52,7 +59,7 @@ jobs:
             Invoke-WebRequest "https://github.com/WhatTheBlock/innounp/releases/download/v0.50/innounp.exe" -OutFile "bundled_tools\innounp.exe"
           }
 
-          # 4. unarc.exe (FreeArc CLI from UniExtract2 release, with FreeArc installer fallback)
+          # 5. Fallback unarc.exe (for raw .arc archives without a setup.exe)
           try {
             Invoke-WebRequest "https://github.com/Bioruebe/UniExtract2/releases/download/v2.0.0-rc.3/UniExtractRC3.zip" -OutFile "_dl\uniextract.zip"
             & "C:\Program Files\7-Zip\7z.exe" e "_dl\uniextract.zip" -o"_dl\unarc" "unarc.exe" -r -y | Out-Null
@@ -61,11 +68,15 @@ jobs:
             & "C:\Program Files\7-Zip\7z.exe" e "_dl\freearc.exe" -o"_dl\unarc" "unarc.exe" -r -y | Out-Null
           }
           $ua = Get-ChildItem "_dl\unarc" -Recurse -Filter "unarc.exe" | Select-Object -First 1
-          if (-not $ua) { throw "Failed to locate unarc.exe" }
-          Copy-Item $ua.FullName "bundled_tools\unarc.exe" -Force
+          if ($ua) { Copy-Item $ua.FullName "bundled_tools\unarc.exe" -Force }
+
+          # 6. Official signed WinFsp MSI (~2.1 MB) embedded for 1-click built-in install
+          $wfRel = Invoke-RestMethod "https://api.github.com/repos/winfsp/winfsp/releases/latest"
+          $wfMsi = $wfRel.assets | Where-Object { $_.name -like "winfsp-*.msi" } | Select-Object -First 1
+          Invoke-WebRequest $wfMsi.browser_download_url -OutFile "bundled_tools\winfsp.msi"
 
           Remove-Item -Recurse -Force _dl
-          Write-Host "Bundled helper binaries ready for embedding:"
+          Write-Host "All bundled binaries ready for embedding:"
           Get-ChildItem bundled_tools | Format-Table Name, Length -AutoSize
 
       - name: Install Rust Stable (2024 edition)

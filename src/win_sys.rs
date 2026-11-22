@@ -327,3 +327,27 @@ pub fn execute_post_queue_action(action: PostQueueAction) {
         }
     }
 }
+
+
+/// Silently installs the built-in signed WinFsp MSI (prompts UAC once if not elevated; no reboot required).
+pub fn install_embedded_winfsp(msi_path: &Path) -> bool {
+    if !msi_path.exists() {
+        return false;
+    }
+    let esc = msi_path.display().to_string().replace('\'', "''");
+    let ps_cmd = if is_elevated() {
+        format!(
+            "$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i','\"{esc}\"','/qn','/norestart'; exit $p.ExitCode"
+        )
+    } else {
+        format!(
+            "$p = Start-Process msiexec.exe -Verb RunAs -Wait -PassThru -ArgumentList '/i','\"{esc}\"','/qn','/norestart'; exit $p.ExitCode"
+        )
+    };
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_cmd])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

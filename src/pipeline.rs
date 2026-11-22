@@ -429,6 +429,17 @@ async fn run_torrent_stream_pipeline(
         }
     }
 
+    if !win_sys::is_winfsp_installed() {
+        let msi = embedded_tools::resolve_tool("winfsp.msi");
+        if msi.exists() {
+            set_progress(shared, None, None, Some("Installing built-in WinFsp driver..."));
+            push_log(shared, "[WINFSP] Auto-installing built-in WinFsp MSI...");
+            if win_sys::install_embedded_winfsp(&msi) {
+                let _ = winfsp::winfsp_init();
+                push_log(shared, "[WINFSP] Driver ready.");
+            }
+        }
+    }
     push_log(shared, format!("[VFS] Mounting WinFsp virtual drive at {}\\", cfg.virtual_drive));
     let mut host = stream_bridge::mount_virtual_drive(&cfg.virtual_drive, vfs)?;
     let mount_root = PathBuf::from(format!("{}\\", cfg.virtual_drive));
@@ -520,10 +531,16 @@ pub fn run_local_turbo_pipeline(
             dissected = dissect::dissect_inno_setup(&innounp, setup, &work_dir)?;
             if dissected.has_unarc_payload {
                 let threads = optimizer::logical_cpu_threads();
+                let host32 = embedded_tools::resolve_tool("unarc_host32.exe");
+                let active_unarc = if work_dir.join("unarc.dll").exists() && host32.exists() {
+                    &host32
+                } else {
+                    &unarc
+                };
                 let report = optimizer::patch_unpacker_configs(
                     &work_dir,
                     &tools,
-                    &unarc,
+                    active_unarc,
                     &cfg.fast_temp_dir,
                     cfg.srep_ram_mb,
                     threads,
@@ -755,8 +772,43 @@ fn run_unarc_extract(
     end_p: f32,
     fname: &str,
 ) -> Result<()> {
+    let host32 = embedded_tools::resolve_tool("unarc_host32.exe");
+    let repack_unarc_dll = work_dir.join("unarc.dll");
+
+    // Preferred path: invoke the repack's OWN unarc.dll via our 32-bit LAA host.
+    // Supports FitGirl, DODI, CODEX, R.G. Mechanics, and custom FreeArc 0.67/modified descriptors!
+    if repack_unarc_dll.exists() && host32.exists() {
+        push_log(
+            shared,
+            format!("[UNARC-DLL] Extracting {fname} via repack's native unarc.dll (32-bit LAA host)"),
+        );
+        let mut args = vec![
+            work_dir.display().to_string(),
+            "x".into(),
+            "-o+".into(),
+            format!("-w{}", fast_temp_dir.display()),
+            format!("-dp{}", target_game_dir.display()),
+        ];
+        if let Some(pwd) = password {
+            args.push(format!("-p{pwd}"));
+        }
+        args.push("--".into());
+        args.push(archive_path.display().to_string());
+        return run_and_stream_logs(
+            &host32,
+            &args,
+            Some(work_dir),
+            fast_temp_dir,
+            shared,
+            control,
+            job_start,
+            start_p,
+            end_p,
+        );
+    }
+
     if !unarc.exists() {
-        anyhow::bail!("tools/unarc.exe is required to unpack FreeArc archive {fname}");
+        anyhow::bail!("Built-in unarc.exe is required to unpack FreeArc archive {fname}");
     }
     let local_unarc = work_dir.join("unarc.exe");
     if !local_unarc.exists() {
@@ -765,6 +817,7 @@ fn run_unarc_extract(
     let mut args = vec![
         "x".into(),
         "-o+".into(),
+        format!("-w{}", fast_temp_dir.display()),
         format!("-dp{}", target_game_dir.display()),
     ];
     if let Some(pwd) = password {
