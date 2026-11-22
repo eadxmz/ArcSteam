@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#pragma comment(lib, "advapi32.lib")
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,6 +80,21 @@ static int __stdcall arc_callback(char *what, int int1, int int2, char *str) {
     return 0;
 }
 
+static HANDLE create_cls_init_map(const char *name, SECURITY_ATTRIBUTES *sa, char **out_view) {
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, sa, PAGE_READWRITE, 0, 256, name);
+    if (h) {
+        char *v = (char *)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 256);
+        if (v) {
+            memset(v, 0, 256);
+            memcpy(v, "Global\\", 8);
+        }
+        *out_view = v;
+    } else {
+        *out_view = NULL;
+    }
+    return h;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: unarc_host32.exe <work_dir> <unarc_args...>\n");
@@ -91,29 +107,24 @@ int main(int argc, char **argv) {
     SetCurrentDirectoryA(work_dir);
     SetDllDirectoryA(work_dir);
 
-    /*
-     * CRITICAL CLS HANDSHAKE:
-     * FitGirl/DODI CLS plugins (cls-srep, cls-magic2l, cls-lolz, cls-lolly) open a 256-byte
-     * named file mapping called "Init_MapFile_" created by the host installer to read the
-     * shared-memory namespace prefix ("Global\\") used for Read_MapFile_* / Write_MapFile_*.
-     * Keep both mapping handle and mapped view alive until after FreeLibrary finishes.
-     */
-    HANDLE hInitMap = CreateFileMappingA(
-        INVALID_HANDLE_VALUE,
-        NULL,
-        PAGE_READWRITE,
-        0,
-        256,
-        "Init_MapFile_"
-    );
-    char *initView = NULL;
-    if (hInitMap) {
-        initView = (char *)MapViewOfFile(hInitMap, FILE_MAP_ALL_ACCESS, 0, 0, 256);
-        if (initView) {
-            memset(initView, 0, 256);
-            memcpy(initView, "Global\\", 8);
-        }
-    }
+    /* Explicit permissive security descriptor (NULL DACL) so all 32/64-bit CLS children can open Init_MapFile_ */
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = TRUE;
+
+    char *localView = NULL;
+    char *globalView = NULL;
+    HANDLE hLocalMap = create_cls_init_map("Init_MapFile_", &sa, &localView);
+    HANDLE hGlobalMap = create_cls_init_map("Global\\Init_MapFile_", &sa, &globalView);
+
+    printf("[UNARC-HOST] v6.2 | Init_MapFile_=%s | Global\\Init_MapFile_=%s\n",
+           (hLocalMap && localView) ? "OK" : "FAIL",
+           (hGlobalMap && globalView) ? "OK" : "FAIL");
+    fflush(stdout);
 
     char dll_path[MAX_PATH * 2];
     _snprintf(dll_path, sizeof(dll_path) - 1, "%s\\unarc.dll", work_dir);
@@ -126,8 +137,10 @@ int main(int argc, char **argv) {
     if (!hmod) {
         printf("ERROR: Failed to load repack unarc.dll (Win32 error %lu)\n", GetLastError());
         fflush(stdout);
-        if (initView) UnmapViewOfFile(initView);
-        if (hInitMap) CloseHandle(hInitMap);
+        if (localView) UnmapViewOfFile(localView);
+        if (hLocalMap) CloseHandle(hLocalMap);
+        if (globalView) UnmapViewOfFile(globalView);
+        if (hGlobalMap) CloseHandle(hGlobalMap);
         return 101;
     }
 
@@ -136,8 +149,10 @@ int main(int argc, char **argv) {
         printf("ERROR: unarc.dll does not export FreeArcExtract\n");
         fflush(stdout);
         FreeLibrary(hmod);
-        if (initView) UnmapViewOfFile(initView);
-        if (hInitMap) CloseHandle(hInitMap);
+        if (localView) UnmapViewOfFile(localView);
+        if (hLocalMap) CloseHandle(hLocalMap);
+        if (globalView) UnmapViewOfFile(globalView);
+        if (hGlobalMap) CloseHandle(hGlobalMap);
         return 102;
     }
 
@@ -158,8 +173,10 @@ int main(int argc, char **argv) {
     );
 
     FreeLibrary(hmod);
-    if (initView) UnmapViewOfFile(initView);
-    if (hInitMap) CloseHandle(hInitMap);
+    if (localView) UnmapViewOfFile(localView);
+    if (hLocalMap) CloseHandle(hLocalMap);
+    if (globalView) UnmapViewOfFile(globalView);
+    if (hGlobalMap) CloseHandle(hGlobalMap);
 
     if (rc != 0) {
         printf("ERROR: FreeArcExtract returned code %d\n", rc);

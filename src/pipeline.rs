@@ -606,13 +606,23 @@ pub fn run_local_turbo_pipeline(
         anyhow::bail!("No supported archives or setup.exe found in {}", source_root.display());
     }
 
-    let total_archives = archives.len() as f32;
+    let archive_sizes: Vec<u64> = archives
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len().max(1)).unwrap_or(1))
+        .collect();
+    let total_archive_bytes: f64 = archive_sizes.iter().sum::<u64>().max(1) as f64;
+    let mut cumulative_bytes: u64 = 0;
+    let unpack_clock = Instant::now();
+    set_progress(shared, None, Some(0.0), None);
+
     for (idx, archive_path) in archives.iter().enumerate() {
         if control.cancel_requested.load(Ordering::Relaxed) {
             anyhow::bail!("Cancelled by user");
         }
-        let start_p = 0.08 + (idx as f32 / total_archives) * 0.85;
-        let end_p = 0.08 + ((idx + 1) as f32 / total_archives) * 0.85;
+        let sz = archive_sizes[idx];
+        let start_p = (cumulative_bytes as f64 / total_archive_bytes) as f32 * 0.96;
+        cumulative_bytes += sz;
+        let end_p = (cumulative_bytes as f64 / total_archive_bytes) as f32 * 0.96;
         let magic = detect::probe_archive_magic(archive_path);
         let fname = archive_path
             .file_name()
@@ -633,7 +643,7 @@ pub fn run_local_turbo_pipeline(
                     dissected.archive_password.as_deref(),
                     shared,
                     control,
-                    job_start,
+                    unpack_clock,
                     start_p,
                     end_p,
                     &fname,
@@ -652,7 +662,7 @@ pub fn run_local_turbo_pipeline(
                     cfg.target_game_dir.display().to_string(),
                     setup.display().to_string(),
                 ];
-                run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, control, job_start, start_p, end_p)?;
+                run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, control, unpack_clock, start_p, end_p)?;
                 break;
             }
             ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip | ArchiveMagic::Iso9660 => {
@@ -663,7 +673,7 @@ pub fn run_local_turbo_pipeline(
                     &cfg.fast_temp_dir,
                     shared,
                     control,
-                    job_start,
+                    unpack_clock,
                     start_p,
                     end_p,
                     &fname,
@@ -680,7 +690,7 @@ pub fn run_local_turbo_pipeline(
                         dissected.archive_password.as_deref(),
                         shared,
                         control,
-                        job_start,
+                        unpack_clock,
                         start_p,
                         end_p,
                         &fname,
@@ -693,7 +703,7 @@ pub fn run_local_turbo_pipeline(
                         &cfg.fast_temp_dir,
                         shared,
                         control,
-                        job_start,
+                        unpack_clock,
                         start_p,
                         end_p,
                         &fname,
@@ -827,7 +837,7 @@ fn run_unarc_extract(
         args.push(format!("-p{pwd}"));
     }
     args.push(archive_path.display().to_string());
-    run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, control, job_start, start_p, end_p)
+    run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, control, unpack_clock, start_p, end_p)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -852,7 +862,7 @@ fn run_7z_extract(
         format!("-o{}", target_game_dir.display()),
         archive_path.display().to_string(),
     ];
-    run_and_stream_logs(seven_zip, &args, None, fast_temp_dir, shared, control, job_start, start_p, end_p)
+    run_and_stream_logs(seven_zip, &args, None, fast_temp_dir, shared, control, unpack_clock, start_p, end_p)
 }
 
 fn resolve_source_file(source_root: &Path, rel_path: &str) -> PathBuf {
@@ -905,12 +915,23 @@ fn run_and_stream_logs(
     let monitor_done = Arc::new(AtomicBool::new(false));
     let mon_flag = monitor_done.clone();
     let mon_shared = shared.clone();
+    let mon_ctrl = control.clone();
     let monitor_thread = std::thread::spawn(move || {
         let mut sys = System::new_all();
+        let mut last_pct: f32 = 0.0;
+        let mut idle_secs: u32 = 0;
+        let mut smooth_eta: Option<f32> = None;
+
         while !mon_flag.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
             if mon_flag.load(Ordering::Relaxed) {
                 break;
+            }
+            if mon_ctrl.paused.load(Ordering::Relaxed) {
+                if let Ok(mut s) = mon_shared.lock() {
+                    s.eta_text = "Paused".into();
+                }
+                continue;
             }
             sys.refresh_all();
             let pids = win_sys::collect_process_tree(&sys, root_pid);
@@ -938,10 +959,26 @@ fn run_and_stream_logs(
                     s.active_worker = top_worker;
                 }
                 let pct = s.unpack_pct;
-                if pct > 0.02 && pct < 0.995 {
+                if (pct - last_pct).abs() > 0.0005 || total_written_bytes > 0 {
+                    last_pct = pct;
+                    idle_secs = 0;
+                } else {
+                    idle_secs += 1;
+                }
+
+                if idle_secs >= 15 && total_written_bytes == 0 {
+                    s.eta_text = "Crunching block...".into();
+                } else if pct >= 0.01 && pct < 0.995 {
                     let elapsed = job_start.elapsed().as_secs_f32();
-                    let remaining = (elapsed / pct) * (1.0 - pct);
-                    s.eta_text = format_eta(remaining);
+                    let raw_rem = (elapsed / pct) * (1.0 - pct);
+                    let smoothed = match smooth_eta {
+                        Some(prev) => prev * 0.75 + raw_rem * 0.25,
+                        None => raw_rem,
+                    };
+                    smooth_eta = Some(smoothed);
+                    s.eta_text = format_eta(smoothed);
+                } else {
+                    s.eta_text = "Calculating...".into();
                 }
             }
         }

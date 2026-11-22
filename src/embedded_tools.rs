@@ -23,8 +23,8 @@ pub fn user_tools_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("tools"))
 }
 
-/// Extracts all helper binaries baked into arcsteam.exe into %LOCALAPPDATA%\ArcSteam\bin\
-/// (only writes if missing or byte size differs).
+/// Extracts all helper binaries baked into arcsteam.exe into %LOCALAPPDATA%\ArcSteam\bin\.
+/// Uses exact byte comparison (not just file length, since MSVC PE padding can keep lengths identical!).
 pub fn ensure_extracted() -> usize {
     let dir = bin_dir();
     let mut ready = 0usize;
@@ -33,8 +33,8 @@ pub fn ensure_extracted() -> usize {
             continue;
         }
         let target = dir.join(name);
-        let up_to_date = fs::metadata(&target)
-            .map(|m| m.len() == bytes.len() as u64)
+        let up_to_date = fs::read(&target)
+            .map(|existing| existing.as_slice() == bytes)
             .unwrap_or(false);
         if up_to_date || fs::write(&target, bytes).is_ok() {
             ready += 1;

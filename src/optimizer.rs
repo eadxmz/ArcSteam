@@ -182,6 +182,21 @@ fn locate_and_stage_srep64(work_dir: &Path, tools_dir: &Path) -> Option<String> 
 ///   to point cleanly to the fastest SSD swap folder.
 /// - Replaces `fgrplc` placeholders in `arc.ini`.
 /// - Scales SREP RAM safely using 64-bit external workers or 32-bit OOM clamping.
+
+fn read_ini_lossy(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let u16s: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&u16s);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 pub fn patch_unpacker_configs(
     work_dir: &Path,
     tools_dir: &Path,
@@ -229,7 +244,7 @@ pub fn patch_unpacker_configs(
     };
 
     let mut cls_content = if cls_ini.exists() {
-        fs::read_to_string(&cls_ini).unwrap_or_default()
+        read_ini_lossy(&cls_ini)
     } else {
         String::new()
     };
@@ -262,7 +277,7 @@ pub fn patch_unpacker_configs(
     // 3. Patch arc.ini placeholders (`fgrplc`, `{tmp}`, `-mem`, `-t`)
     let arc_ini = work_dir.join("arc.ini");
     if arc_ini.exists() {
-        let mut text = fs::read_to_string(&arc_ini)?;
+        let mut text = read_ini_lossy(&arc_ini);
         let re_fgrplc = Regex::new(r"(?i)fgrplc")?;
         text = re_fgrplc.replace_all(&text, "-1").to_string();
         text = text.replace("{tmp}", &work_dir.display().to_string());
