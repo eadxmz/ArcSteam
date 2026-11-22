@@ -44,6 +44,17 @@ impl Default for ArcSteamApp {
             "ArcSteam initialized | Universal Engine: FreeArc / DODI / FitGirl / GOG Inno / 7z / ISO / NSIS",
         );
 
+        let telemetry = Arc::new(Mutex::new(initial_telemetry));
+        let sweep_telemetry = telemetry.clone();
+        std::thread::spawn(move || {
+            let swept = optimizer::sweep_stale_defender_exclusions();
+            if !swept.is_empty() {
+                if let Ok(mut t) = sweep_telemetry.lock() {
+                    t.log(format!("[RECOVERY] Swept {} stale Defender exclusion(s) from prior unclean exit.", swept.len()));
+                }
+            }
+        });
+
         Self {
             tab: SourceTab::TorrentStream,
             magnet_or_torrent: String::new(),
@@ -58,7 +69,7 @@ impl Default for ArcSteamApp {
             srep_ram_mb: optimizer::optimal_srep_ram_mb(),
             detected_format: RepackFormat::FitGirlMultiArc,
             scanned_files: Vec::new(),
-            telemetry: Arc::new(Mutex::new(initial_telemetry)),
+            telemetry,
         }
     }
 }
@@ -140,7 +151,7 @@ impl eframe::App for ArcSteamApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .filter_map(|f| f.path().map(|p| p.to_path_buf()))
                 .collect()
         });
         for path in dropped {
@@ -169,7 +180,7 @@ impl eframe::App for ArcSteamApp {
             ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Header with SVG Logo & Mode Switcher
             ui.horizontal(|ui| {
                 ui.add(

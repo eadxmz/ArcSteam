@@ -223,19 +223,19 @@ async fn run_torrent_stream_pipeline(
         .await?;
     }
 
-    // Direct in-process librqbit Api + FileStream bridge (zero HTTP loopback overhead)
+    // Direct in-process librqbit Api + FileStream bridge with 32 MB contiguous read-ahead
     let api = Arc::new(Api::new(session.clone(), None));
     let rt_handle = tokio::runtime::Handle::current();
     let vfs = TorrentStreamFs::new(api, torrent_id, rt_handle, virtual_files);
 
-    // Prime FreeArc / 7z EOF footers (last 16 MB) directly via FileStream
+    // Prime FreeArc / 7z EOF footers (last 16 MB) + opening 8 MB solid block header
     if detected_fmt.needs_eof_tail_prime() {
-        set_progress(shared, None, None, Some("Priming EOF archive footers (16 MB tail)..."));
+        set_progress(shared, None, None, Some("Priming EOF footers (16 MB) + solid block head (8 MB)..."));
         for entry in &detected_entries {
             if entry.selected && entry.is_archive {
                 if let Some(fid) = entry.torrent_file_idx {
-                    push_log(shared, format!("[PRIME] Fetching EOF footer for {}", entry.rel_path));
-                    let _ = vfs.prime_eof_footer(fid, entry.size_bytes).await;
+                    push_log(shared, format!("[PRIME] Priming EOF + head window for {}", entry.rel_path));
+                    let _ = vfs.prime_eof_and_head(fid, entry.size_bytes).await;
                 }
             }
         }
@@ -250,7 +250,6 @@ async fn run_torrent_stream_pipeline(
     live_cfg.selected_files = detected_entries;
     let shared_clone = shared.clone();
 
-    // Run blocking unpacker on a dedicated thread so Tokio workers stay free for FileStream I/O
     let unpack_result = tokio::task::spawn_blocking(move || {
         run_local_turbo_pipeline(&live_cfg, &mount_root, &shared_clone)
     })
@@ -283,7 +282,7 @@ pub fn run_local_turbo_pipeline(
     std::fs::create_dir_all(&work_dir)?;
 
     let _defender_guard = if cfg.defender_bypass {
-        push_log(shared, "[TURBO] Activating temporary Windows Defender RAII exclusions...");
+        push_log(shared, "[TURBO] Activating crash-safe Windows Defender exclusions...");
         Some(DefenderExclusionGuard::activate(vec![
             source_root.to_path_buf(),
             cfg.fast_temp_dir.clone(),
@@ -330,16 +329,45 @@ pub fn run_local_turbo_pipeline(
             dissected = dissect::dissect_inno_setup(&innounp, setup, &work_dir)?;
             if dissected.has_unarc_payload {
                 let threads = optimizer::logical_cpu_threads();
-                optimizer::patch_unpacker_configs(&work_dir, &cfg.fast_temp_dir, cfg.srep_ram_mb, threads)?;
-                push_log(
-                    shared,
-                    format!(
-                        "[PATCH] SREP RAM -> {} MB | Threads -> {} | Swap -> {}",
-                        cfg.srep_ram_mb,
-                        threads,
-                        cfg.fast_temp_dir.display()
-                    ),
-                );
+                let report = optimizer::patch_unpacker_configs(
+                    &work_dir,
+                    &tools,
+                    &unarc,
+                    &cfg.fast_temp_dir,
+                    cfg.srep_ram_mb,
+                    threads,
+                )?;
+                if let Some(ref s64) = report.external_srep64_used {
+                    push_log(
+                        shared,
+                        format!(
+                            "[PATCH] External 64-bit {s64} active | SREP RAM -> {} MB | Threads -> {} | Swap -> {}",
+                            report.effective_ram_mb,
+                            threads,
+                            cfg.fast_temp_dir.display()
+                        ),
+                    );
+                } else if report.clamped_for_32bit {
+                    push_log(
+                        shared,
+                        format!(
+                            "[WARN] unarc.exe is {:?} and no 64-bit srep64.exe found in tools/. Clamped SREP RAM to {} MB to prevent 32-bit OOM crash.",
+                            report.unarc_bitness,
+                            report.effective_ram_mb
+                        ),
+                    );
+                } else {
+                    push_log(
+                        shared,
+                        format!(
+                            "[PATCH] SREP RAM -> {} MB ({:?}) | Threads -> {} | Swap -> {}",
+                            report.effective_ram_mb,
+                            report.unarc_bitness,
+                            threads,
+                            cfg.fast_temp_dir.display()
+                        ),
+                    );
+                }
             }
         }
     }
@@ -379,45 +407,74 @@ pub fn run_local_turbo_pipeline(
         push_log(shared, format!("[UNPACK] {fname} -> detected magic: {magic:?}"));
 
         match magic {
-            ArchiveMagic::FreeArc | ArchiveMagic::Unknown if unarc.exists() && (dissected.has_unarc_payload || fmt != RepackFormat::SceneArchiveOrIso) => {
-                let local_unarc = work_dir.join("unarc.exe");
-                if !local_unarc.exists() {
-                    let _ = std::fs::copy(&unarc, &local_unarc);
-                }
-                let mut args = vec![
-                    "x".into(),
-                    "-o+".into(),
-                    format!("-dp{}", cfg.target_game_dir.display()),
-                ];
-                if let Some(pwd) = &dissected.archive_password {
-                    args.push(format!("-p{pwd}"));
-                }
-                args.push(archive_path.display().to_string());
-                run_and_stream_logs(&local_unarc, &args, Some(&work_dir), &cfg.fast_temp_dir, shared, start_p, end_p)?;
+            ArchiveMagic::FreeArc => {
+                run_unarc_extract(
+                    &unarc,
+                    &work_dir,
+                    archive_path,
+                    &cfg.target_game_dir,
+                    &cfg.fast_temp_dir,
+                    dissected.archive_password.as_deref(),
+                    shared,
+                    start_p,
+                    end_p,
+                    &fname,
+                )?;
             }
-            ArchiveMagic::InnoSlice if innoextract.exists() => {
-                if let Some(setup) = &setup_exe {
-                    let args = vec![
-                        "-e".into(),
-                        "-d".into(),
-                        cfg.target_game_dir.display().to_string(),
-                        setup.display().to_string(),
-                    ];
-                    run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, start_p, end_p)?;
-                    break;
+            ArchiveMagic::InnoSlice => {
+                if !innoextract.exists() {
+                    anyhow::bail!("tools/innoextract.exe is required to unpack Inno slice {fname}");
                 }
-            }
-            ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip | ArchiveMagic::Iso9660 | ArchiveMagic::Unknown => {
-                if !seven_zip.exists() {
-                    anyhow::bail!("tools/7z.exe is required to unpack {fname}");
-                }
+                let setup = setup_exe.as_ref().with_context(|| {
+                    format!("Found Inno slice {fname} but no matching setup*.exe")
+                })?;
                 let args = vec![
-                    "x".into(),
-                    "-y".into(),
-                    format!("-o{}", cfg.target_game_dir.display()),
-                    archive_path.display().to_string(),
+                    "-e".into(),
+                    "-d".into(),
+                    cfg.target_game_dir.display().to_string(),
+                    setup.display().to_string(),
                 ];
-                run_and_stream_logs(&seven_zip, &args, None, &cfg.fast_temp_dir, shared, start_p, end_p)?;
+                run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, start_p, end_p)?;
+                break;
+            }
+            ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip | ArchiveMagic::Iso9660 => {
+                run_7z_extract(
+                    &seven_zip,
+                    archive_path,
+                    &cfg.target_game_dir,
+                    &cfg.fast_temp_dir,
+                    shared,
+                    start_p,
+                    end_p,
+                    &fname,
+                )?;
+            }
+            ArchiveMagic::Unknown => {
+                if unarc.exists() && (dissected.has_unarc_payload || fmt != RepackFormat::SceneArchiveOrIso) {
+                    run_unarc_extract(
+                        &unarc,
+                        &work_dir,
+                        archive_path,
+                        &cfg.target_game_dir,
+                        &cfg.fast_temp_dir,
+                        dissected.archive_password.as_deref(),
+                        shared,
+                        start_p,
+                        end_p,
+                        &fname,
+                    )?;
+                } else {
+                    run_7z_extract(
+                        &seven_zip,
+                        archive_path,
+                        &cfg.target_game_dir,
+                        &cfg.fast_temp_dir,
+                        shared,
+                        start_p,
+                        end_p,
+                        &fname,
+                    )?;
+                }
             }
         }
     }
@@ -448,6 +505,61 @@ pub fn run_local_turbo_pipeline(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_unarc_extract(
+    unarc: &Path,
+    work_dir: &Path,
+    archive_path: &Path,
+    target_game_dir: &Path,
+    fast_temp_dir: &Path,
+    password: Option<&str>,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    start_p: f32,
+    end_p: f32,
+    fname: &str,
+) -> Result<()> {
+    if !unarc.exists() {
+        anyhow::bail!("tools/unarc.exe is required to unpack FreeArc archive {fname}");
+    }
+    let local_unarc = work_dir.join("unarc.exe");
+    if !local_unarc.exists() {
+        let _ = std::fs::copy(unarc, &local_unarc);
+    }
+    let mut args = vec![
+        "x".into(),
+        "-o+".into(),
+        format!("-dp{}", target_game_dir.display()),
+    ];
+    if let Some(pwd) = password {
+        args.push(format!("-p{pwd}"));
+    }
+    args.push(archive_path.display().to_string());
+    run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, start_p, end_p)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_7z_extract(
+    seven_zip: &Path,
+    archive_path: &Path,
+    target_game_dir: &Path,
+    fast_temp_dir: &Path,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    start_p: f32,
+    end_p: f32,
+    fname: &str,
+) -> Result<()> {
+    if !seven_zip.exists() {
+        anyhow::bail!("tools/7z.exe is required to unpack {fname}");
+    }
+    let args = vec![
+        "x".into(),
+        "-y".into(),
+        format!("-o{}", target_game_dir.display()),
+        archive_path.display().to_string(),
+    ];
+    run_and_stream_logs(seven_zip, &args, None, fast_temp_dir, shared, start_p, end_p)
 }
 
 fn resolve_source_file(source_root: &Path, rel_path: &str) -> PathBuf {

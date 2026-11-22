@@ -1,6 +1,7 @@
 use anyhow::Result;
 use regex::Regex;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -9,20 +10,89 @@ use sysinfo::System;
 const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// RAII guard: temporarily excludes active extraction paths from Windows Defender
-/// real-time scanning and automatically removes exclusions on Drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeBitness {
+    Bit64,
+    Bit32Laa, // 32-bit with IMAGE_FILE_LARGE_ADDRESS_AWARE (up to ~4 GB)
+    Bit32,    // 32-bit standard (strict 2 GB user-space limit)
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct SrepPatchReport {
+    pub effective_ram_mb: u64,
+    pub external_srep64_used: Option<String>,
+    pub unarc_bitness: PeBitness,
+    pub clamped_for_32bit: bool,
+}
+
+fn exclusion_state_file() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let dir = PathBuf::from(local).join("ArcSteam");
+        let _ = fs::create_dir_all(&dir);
+        return dir.join("active_defender_exclusions.txt");
+    }
+    std::env::temp_dir().join("arcsteam_active_defender_exclusions.txt")
+}
+
+fn ps_escape(path: &Path) -> String {
+    path.display().to_string().replace('\'', "''")
+}
+
+fn remove_defender_exclusion(path: &Path) {
+    let escaped = ps_escape(path);
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Remove-MpPreference -ExclusionPath '{escaped}'"),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
+/// Sweeps any leftover temporary Windows Defender exclusions recorded in the state file
+/// from an earlier Task Manager force-kill or unexpected power loss.
+pub fn sweep_stale_defender_exclusions() -> Vec<String> {
+    let state_path = exclusion_state_file();
+    let Ok(content) = fs::read_to_string(&state_path) else {
+        return Vec::new();
+    };
+    let mut swept = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            remove_defender_exclusion(Path::new(trimmed));
+            swept.push(trimmed.to_string());
+        }
+    }
+    let _ = fs::remove_file(&state_path);
+    swept
+}
+
+/// Crash-safe RAII guard: logs active paths to disk before registering exclusions so even
+/// a force-kill or power loss gets automatically cleaned up on next launch.
 pub struct DefenderExclusionGuard {
     paths: Vec<PathBuf>,
 }
 
 impl DefenderExclusionGuard {
     pub fn activate(paths: Vec<PathBuf>) -> Self {
+        let state_path = exclusion_state_file();
+        let serialized: String = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(&state_path, serialized);
+
         for p in &paths {
+            let escaped = ps_escape(p);
             let _ = Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
-                    &format!("Add-MpPreference -ExclusionPath '{}'", p.display()),
+                    &format!("Add-MpPreference -ExclusionPath '{escaped}'"),
                 ])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status();
@@ -34,15 +104,42 @@ impl DefenderExclusionGuard {
 impl Drop for DefenderExclusionGuard {
     fn drop(&mut self) {
         for p in &self.paths {
-            let _ = Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    &format!("Remove-MpPreference -ExclusionPath '{}'", p.display()),
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status();
+            remove_defender_exclusion(p);
         }
+        let _ = fs::remove_file(exclusion_state_file());
+    }
+}
+
+/// Inspects a Windows PE header to distinguish 64-bit, 32-bit LAA, and standard 32-bit binaries.
+pub fn inspect_pe_bitness(exe_path: &Path) -> PeBitness {
+    let Ok(mut f) = File::open(exe_path) else {
+        return PeBitness::Unknown;
+    };
+    let mut dos = [0u8; 64];
+    if f.read_exact(&mut dos).is_err() || &dos[0..2] != b"MZ" {
+        return PeBitness::Unknown;
+    }
+    let e_lfanew = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]) as u64;
+    if f.seek(SeekFrom::Start(e_lfanew)).is_err() {
+        return PeBitness::Unknown;
+    }
+    let mut coff = [0u8; 24];
+    if f.read_exact(&mut coff).is_err() || &coff[0..4] != b"PE\0\0" {
+        return PeBitness::Unknown;
+    }
+    let machine = u16::from_le_bytes([coff[4], coff[5]]);
+    let characteristics = u16::from_le_bytes([coff[22], coff[23]]);
+
+    match machine {
+        0x8664 | 0xAA64 => PeBitness::Bit64,
+        0x014C => {
+            if (characteristics & 0x0020) != 0 {
+                PeBitness::Bit32Laa
+            } else {
+                PeBitness::Bit32
+            }
+        }
+        _ => PeBitness::Unknown,
     }
 }
 
@@ -60,20 +157,77 @@ pub fn logical_cpu_threads() -> usize {
         .unwrap_or(4)
 }
 
-/// Patches extracted cls-srep.ini, cls.ini, and arc.ini to lift 2-4 GB repack RAM caps,
-/// unlock all CPU threads, and route SREP swap files to the fastest SSD temp directory.
+/// Searches work_dir and tools_dir for a 64-bit standalone srep binary and stages it into work_dir
+/// so 32-bit unarc.exe can offload multi-GB deduplication into a 64-bit child process.
+fn locate_and_stage_srep64(work_dir: &Path, tools_dir: &Path) -> Option<String> {
+    let candidates = ["cls-srep_x64.exe", "srep64.exe", "srep_x64.exe", "srep.exe"];
+    for dir in [work_dir, tools_dir] {
+        for name in candidates {
+            let p = dir.join(name);
+            if p.exists() && inspect_pe_bitness(&p) == PeBitness::Bit64 {
+                let staged_name = if name == "cls-srep_x64.exe" {
+                    "cls-srep_x64.exe"
+                } else {
+                    "srep64.exe"
+                };
+                let dst = work_dir.join(staged_name);
+                if p != dst {
+                    let _ = fs::copy(&p, &dst);
+                }
+                // Also mirror as cls-srep_x64.exe because ProFrager's cls-srep.dll probes that exact name.
+                let cls_x64 = work_dir.join("cls-srep_x64.exe");
+                if !cls_x64.exists() {
+                    let _ = fs::copy(&p, &cls_x64);
+                }
+                return Some(staged_name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Patches extracted cls-srep.ini, cls.ini, and arc.ini to scale RAM safely:
+/// - If a 64-bit srep helper or 64-bit unarc.exe is available, unlocks full requested RAM via external 64-bit process.
+/// - If unarc.exe is 32-bit with no 64-bit srep helper, clamps RAM to prevent 32-bit OOM crashes.
 pub fn patch_unpacker_configs(
     work_dir: &Path,
+    tools_dir: &Path,
+    unarc_exe: &Path,
     fast_temp_dir: &Path,
-    ram_mb: u64,
+    requested_ram_mb: u64,
     threads: usize,
-) -> Result<()> {
+) -> Result<SrepPatchReport> {
     fs::create_dir_all(fast_temp_dir)?;
 
-    let srep_cfg = format!(
-        "[srep]\nMemory={ram_mb}m\nTempPath={}\n",
-        fast_temp_dir.display()
-    );
+    let unarc_bitness = inspect_pe_bitness(unarc_exe);
+    let external_srep64 = locate_and_stage_srep64(work_dir, tools_dir);
+
+    let (effective_ram_mb, clamped) = if external_srep64.is_some() || unarc_bitness == PeBitness::Bit64 {
+        (requested_ram_mb, false)
+    } else {
+        let cap = match unarc_bitness {
+            PeBitness::Bit32Laa => 2600,
+            PeBitness::Bit32 | PeBitness::Unknown => 1400,
+            PeBitness::Bit64 => requested_ram_mb,
+        };
+        if requested_ram_mb > cap {
+            (cap, true)
+        } else {
+            (requested_ram_mb, false)
+        }
+    };
+
+    let srep_cfg = if let Some(ref exe64) = external_srep64 {
+        format!(
+            "[srep]\nMemory={effective_ram_mb}m\nTempPath={}\nExe={exe64}\n",
+            fast_temp_dir.display()
+        )
+    } else {
+        format!(
+            "[srep]\nMemory={effective_ram_mb}m\nTempPath={}\n",
+            fast_temp_dir.display()
+        )
+    };
     fs::write(work_dir.join("cls-srep.ini"), &srep_cfg)?;
 
     let cls_ini = work_dir.join("cls.ini");
@@ -83,7 +237,7 @@ pub fn patch_unpacker_configs(
         String::new()
     };
     if !cls_content.to_ascii_lowercase().contains("[srep]") {
-        cls_content.push_str("\n");
+        cls_content.push('\n');
         cls_content.push_str(&srep_cfg);
     }
     if !cls_content.to_ascii_lowercase().contains("[lolz]") {
@@ -95,12 +249,22 @@ pub fn patch_unpacker_configs(
     if arc_ini.exists() {
         let mut text = fs::read_to_string(&arc_ini)?;
         let re_mem = Regex::new(r"(?i)-mem\d+m?b?")?;
-        text = re_mem.replace_all(&text, format!("-mem{ram_mb}mb")).to_string();
+        text = re_mem.replace_all(&text, format!("-mem{effective_ram_mb}mb")).to_string();
         let re_threads = Regex::new(r"(?i)-t\d+")?;
         text = re_threads.replace_all(&text, format!("-t{threads}")).to_string();
+        if let Some(ref exe64) = external_srep64 {
+            let re_srep_cmd = Regex::new(r"(?i)\bsrep\.exe\b")?;
+            text = re_srep_cmd.replace_all(&text, exe64.as_str()).to_string();
+        }
         fs::write(&arc_ini, text)?;
     }
-    Ok(())
+
+    Ok(SrepPatchReport {
+        effective_ram_mb,
+        external_srep64_used: external_srep64,
+        unarc_bitness,
+        clamped_for_32bit: clamped,
+    })
 }
 
 /// Spawns any unpacker (unarc.exe, innoextract.exe, 7z.exe) headlessly at HIGH_PRIORITY_CLASS
