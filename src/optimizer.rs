@@ -13,8 +13,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeBitness {
     Bit64,
-    Bit32Laa, // 32-bit with IMAGE_FILE_LARGE_ADDRESS_AWARE (up to ~4 GB)
-    Bit32,    // 32-bit standard (strict 2 GB user-space limit)
+    Bit32Laa,
+    Bit32,
     Unknown,
 }
 
@@ -51,8 +51,6 @@ fn remove_defender_exclusion(path: &Path) {
         .status();
 }
 
-/// Sweeps any leftover temporary Windows Defender exclusions recorded in the state file
-/// from an earlier Task Manager force-kill or unexpected power loss.
 pub fn sweep_stale_defender_exclusions() -> Vec<String> {
     let state_path = exclusion_state_file();
     let Ok(content) = fs::read_to_string(&state_path) else {
@@ -70,8 +68,6 @@ pub fn sweep_stale_defender_exclusions() -> Vec<String> {
     swept
 }
 
-/// Crash-safe RAII guard: logs active paths to disk before registering exclusions so even
-/// a force-kill or power loss gets automatically cleaned up on next launch.
 pub struct DefenderExclusionGuard {
     paths: Vec<PathBuf>,
 }
@@ -110,7 +106,6 @@ impl Drop for DefenderExclusionGuard {
     }
 }
 
-/// Inspects a Windows PE header to distinguish 64-bit, 32-bit LAA, and standard 32-bit binaries.
 pub fn inspect_pe_bitness(exe_path: &Path) -> PeBitness {
     let Ok(mut f) = File::open(exe_path) else {
         return PeBitness::Unknown;
@@ -143,7 +138,6 @@ pub fn inspect_pe_bitness(exe_path: &Path) -> PeBitness {
     }
 }
 
-/// Returns ~65% of currently available system RAM (clamped safely for SREP).
 pub fn optimal_srep_ram_mb() -> u64 {
     let mut sys = System::new_all();
     sys.refresh_memory();
@@ -157,8 +151,6 @@ pub fn logical_cpu_threads() -> usize {
         .unwrap_or(4)
 }
 
-/// Searches work_dir and tools_dir for a 64-bit standalone srep binary and stages it into work_dir
-/// so 32-bit unarc.exe can offload multi-GB deduplication into a 64-bit child process.
 fn locate_and_stage_srep64(work_dir: &Path, tools_dir: &Path) -> Option<String> {
     let candidates = ["cls-srep_x64.exe", "srep64.exe", "srep_x64.exe", "srep.exe"];
     for dir in [work_dir, tools_dir] {
@@ -174,7 +166,6 @@ fn locate_and_stage_srep64(work_dir: &Path, tools_dir: &Path) -> Option<String> 
                 if p != dst {
                     let _ = fs::copy(&p, &dst);
                 }
-                // Also mirror as cls-srep_x64.exe because ProFrager's cls-srep.dll probes that exact name.
                 let cls_x64 = work_dir.join("cls-srep_x64.exe");
                 if !cls_x64.exists() {
                     let _ = fs::copy(&p, &cls_x64);
@@ -186,9 +177,11 @@ fn locate_and_stage_srep64(work_dir: &Path, tools_dir: &Path) -> Option<String> 
     None
 }
 
-/// Patches extracted cls-srep.ini, cls.ini, and arc.ini to scale RAM safely:
-/// - If a 64-bit srep helper or 64-bit unarc.exe is available, unlocks full requested RAM via external 64-bit process.
-/// - If unarc.exe is 32-bit with no 64-bit srep helper, clamps RAM to prevent 32-bit OOM crashes.
+/// Patches extracted CLS.ini, cls-srep.ini, and arc.ini in-place:
+/// - Rewrites ALL FitGirl/DODI placeholder paths (`TempPath={app}`, `TempPath={tmp}`, `{tmp}`)
+///   to point cleanly to the fastest SSD swap folder.
+/// - Replaces `fgrplc` placeholders in `arc.ini`.
+/// - Scales SREP RAM safely using 64-bit external workers or 32-bit OOM clamping.
 pub fn patch_unpacker_configs(
     work_dir: &Path,
     tools_dir: &Path,
@@ -222,35 +215,57 @@ pub fn patch_unpacker_configs(
         temp_with_slash.push('\\');
     }
 
-    let srep_cfg = if let Some(ref exe64) = external_srep64 {
-        format!(
-            "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\nExe={exe64}\n"
-        )
-    } else {
-        format!(
-            "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\n"
-        )
-    };
+    // 1. Write standalone cls-srep.ini fallback
+    let srep_cfg = format!(
+        "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\n"
+    );
     fs::write(work_dir.join("cls-srep.ini"), &srep_cfg)?;
 
-    let cls_ini = work_dir.join("cls.ini");
+    // 2. Patch repack's own CLS.ini in-place (preserving [magic2]/[magic2l]/[lolz] buffers)
+    let cls_ini = if work_dir.join("CLS.ini").exists() {
+        work_dir.join("CLS.ini")
+    } else {
+        work_dir.join("cls.ini")
+    };
+
     let mut cls_content = if cls_ini.exists() {
         fs::read_to_string(&cls_ini).unwrap_or_default()
     } else {
         String::new()
     };
+
+    if !cls_content.is_empty() {
+        let re_temp = Regex::new(r"(?im)^(\s*TempPath\s*=).*$")?;
+        cls_content = re_temp
+            .replace_all(&cls_content, |caps: &regex::Captures| format!("{}{temp_with_slash}", &caps[1]))
+            .to_string();
+
+        let re_mem_line = Regex::new(r"(?im)^(\s*Memory\s*=).*$")?;
+        cls_content = re_mem_line
+            .replace_all(&cls_content, |caps: &regex::Captures| format!("{}{effective_ram_mb}m", &caps[1]))
+            .to_string();
+
+        cls_content = cls_content
+            .replace("{app}", &fast_temp_dir.display().to_string())
+            .replace("{tmp}", &work_dir.display().to_string());
+    }
+
     if !cls_content.to_ascii_lowercase().contains("[srep]") {
         cls_content.push('\n');
         cls_content.push_str(&srep_cfg);
     }
     if !cls_content.to_ascii_lowercase().contains("[lolz]") {
-        cls_content.push_str(&format!("\n[lolz]\nMaxThreadsUsage={threads}\n"));
+        cls_content.push_str(&format!("\n[lolz]\nMaxThreadsUsage={threads}\nTempPath={temp_with_slash}\n"));
     }
     fs::write(&cls_ini, cls_content)?;
 
+    // 3. Patch arc.ini placeholders (`fgrplc`, `{tmp}`, `-mem`, `-t`)
     let arc_ini = work_dir.join("arc.ini");
     if arc_ini.exists() {
         let mut text = fs::read_to_string(&arc_ini)?;
+        let re_fgrplc = Regex::new(r"(?i)fgrplc")?;
+        text = re_fgrplc.replace_all(&text, "-1").to_string();
+        text = text.replace("{tmp}", &work_dir.display().to_string());
         let re_mem = Regex::new(r"(?i)-mem\d+m?b?")?;
         text = re_mem.replace_all(&text, format!("-mem{effective_ram_mb}mb")).to_string();
         let re_threads = Regex::new(r"(?i)-t\d+")?;
@@ -270,8 +285,6 @@ pub fn patch_unpacker_configs(
     })
 }
 
-/// Spawns any unpacker (unarc.exe, innoextract.exe, 7z.exe) headlessly at HIGH_PRIORITY_CLASS
-/// with split-drive TEMP/TMP environment variables.
 pub fn spawn_turbo_process(
     exe: &Path,
     args: &[String],

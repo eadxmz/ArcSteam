@@ -85,9 +85,35 @@ int main(int argc, char **argv) {
         return 100;
     }
 
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+
     const char *work_dir = argv[1];
     SetCurrentDirectoryA(work_dir);
     SetDllDirectoryA(work_dir);
+
+    /*
+     * CRITICAL CLS HANDSHAKE:
+     * FitGirl/DODI CLS plugins (cls-srep, cls-magic2l, cls-lolz, cls-lolly) open a 256-byte
+     * named file mapping called "Init_MapFile_" created by the host installer to read the
+     * shared-memory namespace prefix ("Global\\") used for Read_MapFile_* / Write_MapFile_*.
+     * Keep both mapping handle and mapped view alive until after FreeLibrary finishes.
+     */
+    HANDLE hInitMap = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        NULL,
+        PAGE_READWRITE,
+        0,
+        256,
+        "Init_MapFile_"
+    );
+    char *initView = NULL;
+    if (hInitMap) {
+        initView = (char *)MapViewOfFile(hInitMap, FILE_MAP_ALL_ACCESS, 0, 0, 256);
+        if (initView) {
+            memset(initView, 0, 256);
+            memcpy(initView, "Global\\", 8);
+        }
+    }
 
     char dll_path[MAX_PATH * 2];
     _snprintf(dll_path, sizeof(dll_path) - 1, "%s\\unarc.dll", work_dir);
@@ -100,6 +126,8 @@ int main(int argc, char **argv) {
     if (!hmod) {
         printf("ERROR: Failed to load repack unarc.dll (Win32 error %lu)\n", GetLastError());
         fflush(stdout);
+        if (initView) UnmapViewOfFile(initView);
+        if (hInitMap) CloseHandle(hInitMap);
         return 101;
     }
 
@@ -108,6 +136,8 @@ int main(int argc, char **argv) {
         printf("ERROR: unarc.dll does not export FreeArcExtract\n");
         fflush(stdout);
         FreeLibrary(hmod);
+        if (initView) UnmapViewOfFile(initView);
+        if (hInitMap) CloseHandle(hInitMap);
         return 102;
     }
 
@@ -128,6 +158,8 @@ int main(int argc, char **argv) {
     );
 
     FreeLibrary(hmod);
+    if (initView) UnmapViewOfFile(initView);
+    if (hInitMap) CloseHandle(hInitMap);
 
     if (rc != 0) {
         printf("ERROR: FreeArcExtract returned code %d\n", rc);
