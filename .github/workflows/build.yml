@@ -1,0 +1,33 @@
+name: Build ArcSteam (Windows x64)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinFsp Developer SDK
+        shell: pwsh
+        run: choco install winfsp -y --install-arguments="ADDLOCAL=ALL"
+
+      - name: Install Rust Stable (2024 edition)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Crates
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release Binary
+        run: cargo build --release
+
+      - name: Upload arcsteam.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArcSteam-Windows-x64
+          path: |
+            target/release/arcsteam.exe
+            tools/README.txt
