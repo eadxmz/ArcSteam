@@ -1,0 +1,102 @@
+use crate::optimizer;
+use crate::win_sys::PostQueueAction;
+use std::fs;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub local_source: PathBuf,
+    pub download_cache_dir: PathBuf,
+    pub temp_ssd_dir: PathBuf,
+    pub target_game_dir: PathBuf,
+    pub virtual_drive: String,
+    pub live_install_while_dl: bool,
+    pub defender_bypass: bool,
+    pub replay_registry: bool,
+    pub create_shortcuts: bool,
+    pub auto_clean_temp: bool,
+    pub srep_ram_mb: u64,
+    pub post_queue_action: PostQueueAction,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            local_source: PathBuf::from(r"G:\Setup (After NEET)"),
+            download_cache_dir: PathBuf::from(r"G:\ArcSteamCache"),
+            temp_ssd_dir: PathBuf::from(r"C:\ArcSteamTemp"),
+            target_game_dir: PathBuf::from(r"D:\Games"),
+            virtual_drive: "Z:".into(),
+            live_install_while_dl: true,
+            defender_bypass: true,
+            replay_registry: true,
+            create_shortcuts: true,
+            auto_clean_temp: true,
+            srep_ram_mb: optimizer::optimal_srep_ram_mb(),
+            post_queue_action: PostQueueAction::DoNothing,
+        }
+    }
+}
+
+fn config_path() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let dir = PathBuf::from(local).join("ArcSteam");
+        let _ = fs::create_dir_all(&dir);
+        return dir.join("config.ini");
+    }
+    PathBuf::from("arcsteam_config.ini")
+}
+
+impl AppConfig {
+    pub fn load() -> Self {
+        let mut cfg = Self::default();
+        let Ok(content) = fs::read_to_string(config_path()) else {
+            return cfg;
+        };
+        for line in content.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let val = v.trim();
+            match k.trim() {
+                "local_source" if !val.is_empty() => cfg.local_source = PathBuf::from(val),
+                "download_cache_dir" if !val.is_empty() => cfg.download_cache_dir = PathBuf::from(val),
+                "temp_ssd_dir" if !val.is_empty() => cfg.temp_ssd_dir = PathBuf::from(val),
+                "target_game_dir" if !val.is_empty() => cfg.target_game_dir = PathBuf::from(val),
+                "virtual_drive" if !val.is_empty() => cfg.virtual_drive = val.to_string(),
+                "live_install_while_dl" => cfg.live_install_while_dl = val == "true",
+                "defender_bypass" => cfg.defender_bypass = val == "true",
+                "replay_registry" => cfg.replay_registry = val == "true",
+                "create_shortcuts" => cfg.create_shortcuts = val == "true",
+                "auto_clean_temp" => cfg.auto_clean_temp = val == "true",
+                "srep_ram_mb" => {
+                    if let Ok(n) = val.parse::<u64>() {
+                        cfg.srep_ram_mb = n.clamp(1024, 16384);
+                    }
+                }
+                "post_queue_action" => cfg.post_queue_action = PostQueueAction::parse(val),
+                _ => {}
+            }
+        }
+        cfg
+    }
+
+    pub fn save(&self) {
+        let data = format!(
+            "local_source={}\ndownload_cache_dir={}\ntemp_ssd_dir={}\ntarget_game_dir={}\nvirtual_drive={}\nlive_install_while_dl={}\ndefender_bypass={}\nreplay_registry={}\ncreate_shortcuts={}\nauto_clean_temp={}\nsrep_ram_mb={}\npost_queue_action={}\n",
+            self.local_source.display(),
+            self.download_cache_dir.display(),
+            self.temp_ssd_dir.display(),
+            self.target_game_dir.display(),
+            self.virtual_drive,
+            self.live_install_while_dl,
+            self.defender_bypass,
+            self.replay_registry,
+            self.create_shortcuts,
+            self.auto_clean_temp,
+            self.srep_ram_mb,
+            self.post_queue_action.as_str(),
+        );
+        let _ = fs::write(config_path(), data);
+    }
+}

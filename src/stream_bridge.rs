@@ -20,9 +20,7 @@ const STATUS_IO_DEVICE_ERROR: i32 = 0xC000_0185u32 as i32;
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 
-/// Local RAM read cache window per open virtual file (absorbs small sequential FreeArc reads).
 const LOCAL_CACHE_WINDOW: usize = 4 * 1024 * 1024;
-/// Contiguous swarm read-ahead horizon ahead of the active decompression cursor.
 const SWARM_READAHEAD_BYTES: u64 = 32 * 1024 * 1024;
 const SWARM_READAHEAD_CHUNK: usize = 1024 * 1024;
 
@@ -91,7 +89,6 @@ impl TorrentStreamFs {
         }
     }
 
-    /// Pre-fetches a contiguous byte range directly through librqbit's FileStream.
     async fn prime_range(&self, file_id: usize, start: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
@@ -124,7 +121,8 @@ impl TorrentStreamFs {
         }
         let tail = (16 * 1024 * 1024u64).min(total_size);
         let tail_start = total_size.saturating_sub(tail);
-        self.prime_range(file_id, tail_start, total_size - tail_start).await?;
+        self.prime_range(file_id, tail_start, total_size - tail_start)
+            .await?;
 
         let head = (8 * 1024 * 1024u64).min(total_size);
         self.prime_range(file_id, 0, head).await?;
@@ -151,7 +149,6 @@ impl TorrentStreamFs {
                 let cursor = frontier.load(Ordering::Relaxed);
                 let horizon = cursor.saturating_add(SWARM_READAHEAD_BYTES).min(total_size);
 
-                // If unarc jumped to a new solid block, re-anchor the contiguous window immediately.
                 if prefetch_pos < cursor || prefetch_pos > horizon {
                     prefetch_pos = cursor.min(total_size);
                     if pf_stream.seek(SeekFrom::Start(prefetch_pos)).await.is_err() {
@@ -278,8 +275,6 @@ impl FileSystemContext for TorrentStreamFs {
         Ok(())
     }
 
-    /// Serves reads from a 4 MB local sliding window backed by a 32 MB contiguous
-    /// swarm read-ahead prefetcher, eliminating per-chunk peer latency stalls.
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> FspResult<u32> {
         let (Some(vf), Some(state_mtx)) = (&context.file, &context.state) else {
             return Ok(0);
@@ -293,33 +288,36 @@ impl FileSystemContext for TorrentStreamFs {
             .frontier
             .store(offset.saturating_add(target_len as u64), Ordering::Relaxed);
 
-        let mut state = state_mtx
+        let mut state_guard = state_mtx
             .lock()
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        let CachedStreamState {
+            stream,
+            cache_start,
+            cache_buf,
+        } = &mut *state_guard;
 
         let req_end = offset + target_len as u64;
-        let cache_end = state.cache_start + state.cache_buf.len() as u64;
+        let cache_end = *cache_start + cache_buf.len() as u64;
 
-        // Fast-path RAM cache hit
-        if offset >= state.cache_start && req_end <= cache_end {
-            let local_start = (offset - state.cache_start) as usize;
-            buffer[..target_len].copy_from_slice(&state.cache_buf[local_start..local_start + target_len]);
+        if offset >= *cache_start && req_end <= cache_end {
+            let local_start = (offset - *cache_start) as usize;
+            buffer[..target_len].copy_from_slice(&cache_buf[local_start..local_start + target_len]);
             return Ok(target_len as u32);
         }
 
-        // Cache miss: refill a contiguous 4 MB window (or larger if caller asked for >4 MB)
         let fetch_len = target_len
             .max(LOCAL_CACHE_WINDOW)
             .min((vf.size - offset) as usize);
-        state.cache_buf.resize(fetch_len, 0);
+        cache_buf.resize(fetch_len, 0);
 
         let filled = self
             .rt
             .block_on(async {
-                state.stream.seek(SeekFrom::Start(offset)).await?;
+                stream.seek(SeekFrom::Start(offset)).await?;
                 let mut total = 0usize;
                 while total < fetch_len {
-                    let n = state.stream.read(&mut state.cache_buf[total..fetch_len]).await?;
+                    let n = stream.read(&mut cache_buf[total..fetch_len]).await?;
                     if n == 0 {
                         break;
                     }
@@ -329,11 +327,11 @@ impl FileSystemContext for TorrentStreamFs {
             })
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
-        state.cache_buf.truncate(filled);
-        state.cache_start = offset;
+        cache_buf.truncate(filled);
+        *cache_start = offset;
 
         let to_copy = target_len.min(filled);
-        buffer[..to_copy].copy_from_slice(&state.cache_buf[..to_copy]);
+        buffer[..to_copy].copy_from_slice(&cache_buf[..to_copy]);
         Ok(to_copy as u32)
     }
 
@@ -347,7 +345,7 @@ impl FileSystemContext for TorrentStreamFs {
         if context.file.is_some() {
             return Ok(0);
         }
-        if let Ok(mut lock) = self.dir_buffer.acquire(marker.is_none(), None) {
+        if let Ok(lock) = self.dir_buffer.acquire(marker.is_none(), None) {
             for vf in self.files.values() {
                 let mut info = DirInfo::<255>::new();
                 if info.set_name(&vf.virtual_name).is_ok() {
@@ -365,8 +363,6 @@ impl FileSystemContext for TorrentStreamFs {
     }
 }
 
-/// Mounts the demand-paged virtual drive (e.g., "Z:") with a 10-minute IRP timeout
-/// so slow swarms never cause Windows I/O timeout errors inside unarc.exe.
 pub fn mount_virtual_drive(
     drive_letter: &str,
     fs: TorrentStreamFs,
@@ -380,8 +376,9 @@ pub fn mount_virtual_drive(
         .irp_timeout(600_000)
         .file_info_timeout(5_000);
 
-    let mut host: FileSystemHost<TorrentStreamFs> = FileSystemHost::<TorrentStreamFs>::new(params, fs)
-        .map_err(|e| anyhow::anyhow!("WinFsp FileSystemHost::new failed: {e:?}"))?;
+    let mut host: FileSystemHost<TorrentStreamFs> =
+        FileSystemHost::<TorrentStreamFs>::new(params, fs)
+            .map_err(|e| anyhow::anyhow!("WinFsp FileSystemHost::new failed: {e:?}"))?;
     host.mount(drive_letter)
         .map_err(|e| anyhow::anyhow!("WinFsp mount({drive_letter}) failed: {e:?}"))?;
     host.start()

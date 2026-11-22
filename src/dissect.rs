@@ -12,6 +12,7 @@ pub struct DissectedSetup {
     pub work_dir: PathBuf,
     pub archive_password: Option<String>,
     pub registry_entries: Vec<RegistryEntry>,
+    pub icon_entries: Vec<IconEntry>,
     pub safe_post_run: Vec<PostRunCommand>,
     pub has_unarc_payload: bool,
 }
@@ -26,13 +27,20 @@ pub struct RegistryEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct IconEntry {
+    pub name: String,
+    pub filename: String,
+    pub working_dir: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PostRunCommand {
     pub filename: String,
     pub parameters: String,
 }
 
 /// Unpacks setup.exe's embedded {tmp} plugins (unarc.dll, cls-srep, cls-lolz, xtool, arc.ini)
-/// and parses install_script.iss for passwords, [Registry], and safe [Run] post-install steps.
+/// and parses install_script.iss for passwords, [Registry], [Icons], and safe [Run] tasks.
 pub fn dissect_inno_setup(
     innounp_exe: &Path,
     setup_exe: &Path,
@@ -60,7 +68,6 @@ pub fn dissect_inno_setup(
         return Ok(result);
     }
 
-    // Flatten {tmp} binaries into work_dir so unarc.exe finds cls-*.dll, xtool.exe, arc.ini immediately.
     let tmp_sub = work_dir.join("{tmp}");
     if tmp_sub.is_dir() {
         if let Ok(read_dir) = fs::read_dir(&tmp_sub) {
@@ -91,7 +98,6 @@ pub fn dissect_inno_setup(
 }
 
 fn parse_install_script(script: &str, out: &mut DissectedSetup) {
-    // 1. Extract FreeArc password if present in ISArcExtract / ArcExtract calls
     let re_pwd = Regex::new(r#"(?i)ISArcExtract\([^;]*?'([^']{2,64})'\s*,\s*false"#).ok();
     if let Some(re) = re_pwd {
         if let Some(cap) = re.captures(script) {
@@ -104,9 +110,11 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
         }
     }
 
-    // 2. Parse [Registry] and safe [Run] sections
     let mut section = "";
-    let re_kv = Regex::new(r#"(?i)(Root|Subkey|ValueType|ValueName|ValueData|Filename|Parameters)\s*:\s*("([^"]*)"|([^;\r\n]+))"#).unwrap();
+    let re_kv = Regex::new(
+        r#"(?i)(Root|Subkey|ValueType|ValueName|ValueData|Filename|Parameters|Name|WorkingDir)\s*:\s*("([^"]*)"|([^;\r\n]+))"#,
+    )
+    .unwrap();
 
     for raw_line in script.lines() {
         let line = raw_line.trim();
@@ -150,6 +158,37 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
                     value_data,
                 });
             }
+        } else if section.eq_ignore_ascii_case("[Icons]") {
+            let mut name = String::new();
+            let mut filename = String::new();
+            let mut working_dir = String::new();
+            for cap in re_kv.captures_iter(line) {
+                let k = cap[1].to_ascii_lowercase();
+                let v = cap
+                    .get(3)
+                    .or_else(|| cap.get(4))
+                    .map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_default();
+                match k.as_str() {
+                    "name" => name = v,
+                    "filename" => filename = v,
+                    "workingdir" => working_dir = v,
+                    _ => {}
+                }
+            }
+            let lower_fn = filename.to_ascii_lowercase();
+            if lower_fn.ends_with(".exe")
+                && !lower_fn.contains("unins")
+                && !name.is_empty()
+                && (name.to_ascii_lowercase().contains("desktop")
+                    || out.icon_entries.is_empty())
+            {
+                out.icon_entries.push(IconEntry {
+                    name,
+                    filename,
+                    working_dir,
+                });
+            }
         } else if section.eq_ignore_ascii_case("[Run]") {
             let mut filename = String::new();
             let mut parameters = String::new();
@@ -183,7 +222,6 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
     }
 }
 
-/// Replays parsed Inno [Registry] keys into Windows so legacy games (Ubisoft/WB/EA) launch cleanly.
 pub fn apply_registry_entries(entries: &[RegistryEntry], target_app_dir: &Path) -> usize {
     let app_str = target_app_dir.display().to_string();
     let mut applied = 0;
@@ -219,4 +257,59 @@ pub fn apply_registry_entries(entries: &[RegistryEntry], target_app_dir: &Path) 
         }
     }
     applied
+}
+
+/// Creates Desktop `.lnk` shortcuts for parsed Inno `[Icons]` game executables.
+pub fn create_desktop_shortcuts(icons: &[IconEntry], target_app_dir: &Path) -> usize {
+    let app_str = target_app_dir.display().to_string();
+    let mut created = 0usize;
+    let mut seen_targets = std::collections::HashSet::new();
+
+    for icon in icons {
+        let exe_path = PathBuf::from(icon.filename.replace("{app}", &app_str));
+        if !exe_path.exists() || !seen_targets.insert(exe_path.clone()) {
+            continue;
+        }
+        let clean_name = icon
+            .name
+            .rsplit('\\')
+            .next()
+            .unwrap_or("Game")
+            .replace([':', '*', '?', '"', '<', '>', '|'], "")
+            .trim()
+            .to_string();
+        if clean_name.is_empty() {
+            continue;
+        }
+        let work_dir = if icon.working_dir.is_empty() {
+            exe_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| app_str.clone())
+        } else {
+            icon.working_dir.replace("{app}", &app_str)
+        };
+
+        let esc_name = clean_name.replace('\'', "''");
+        let esc_target = exe_path.display().to_string().replace('\'', "''");
+        let esc_work = work_dir.replace('\'', "''");
+
+        let ps = format!(
+            "$ws = New-Object -ComObject WScript.Shell; \
+             $lnk = $ws.CreateShortcut([Environment]::GetFolderPath('Desktop') + '\\{esc_name}.lnk'); \
+             $lnk.TargetPath = '{esc_target}'; \
+             $lnk.WorkingDirectory = '{esc_work}'; \
+             $lnk.Save()"
+        );
+        if Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            created += 1;
+        }
+    }
+    created
 }
