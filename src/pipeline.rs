@@ -1,10 +1,10 @@
-use regex::Regex;
 use crate::detect::{self, ArchiveMagic, RepackFileEntry, RepackFormat};
 use crate::dissect;
 use crate::optimizer::{self, DefenderExclusionGuard};
 use crate::stream_bridge::{self, TorrentStreamFs, VirtualTorrentFile};
 use anyhow::{Context, Result};
 use librqbit::{AddTorrent, AddTorrentOptions, Api, Session};
+use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ pub struct JobConfig {
     pub download_cache_dir: PathBuf,
     pub fast_temp_dir: PathBuf,
     pub target_game_dir: PathBuf,
-    pub virtual_drive: String, // e.g. "Z:"
+    pub virtual_drive: String,
     pub live_stream_install: bool,
     pub defender_bypass: bool,
     pub replay_registry: bool,
@@ -140,7 +140,6 @@ async fn run_torrent_stream_pipeline(
         AddTorrent::from_local_filename(cfg.magnet_or_torrent.trim())?
     };
 
-    // Pass selected file indices so unselected optional/language .bin files are skipped completely.
     let only_files: Option<Vec<usize>> = if cfg.selected_files.is_empty() {
         None
     } else {
@@ -174,7 +173,6 @@ async fn run_torrent_stream_pipeline(
 
     push_log(shared, format!("[TORRENT] Managed torrent id={torrent_id}. Resolving metadata..."));
 
-    // Build virtual file list from torrent metadata
     let mut virtual_files = Vec::new();
     let mut classified_raw = Vec::new();
     let _ = handle.with_metadata(|meta| {
@@ -196,7 +194,6 @@ async fn run_torrent_stream_pipeline(
     let (detected_fmt, detected_entries) = detect::classify_repack(&classified_raw);
     push_log(shared, format!("[DETECT] Blueprint identified: {}", detected_fmt.badge()));
 
-    // Spawn live download progress tracker
     let handle_stats = handle.clone();
     let shared_stats = shared.clone();
     let stats_task = tokio::spawn(async move {
@@ -217,41 +214,33 @@ async fn run_torrent_stream_pipeline(
         set_progress(shared, None, None, Some("Downloading full torrent before turbo unpack..."));
         handle.wait_until_completed().await?;
         stats_task.abort();
-        return run_local_turbo_pipeline(cfg, &cfg.download_cache_dir, shared);
+        let cfg_clone = cfg.clone();
+        let cache_dir = cfg.download_cache_dir.clone();
+        let shared_clone = shared.clone();
+        return tokio::task::spawn_blocking(move || {
+            run_local_turbo_pipeline(&cfg_clone, &cache_dir, &shared_clone)
+        })
+        .await?;
     }
 
-    // Start local loopback HTTP Range streamer for WinFsp bridge
-    let api = Api::new(session.clone(), None);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
+    // Direct in-process librqbit Api + FileStream bridge (zero HTTP loopback overhead)
+    let api = Arc::new(Api::new(session.clone(), None));
+    let rt_handle = tokio::runtime::Handle::current();
+    let vfs = TorrentStreamFs::new(api, torrent_id, rt_handle, virtual_files);
 
-    let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-    let http_api = librqbit::http_api::HttpApi::new(api, None);
-    tokio::spawn(async move {
-        let _ = http_api.make_http_api_and_run(listen_addr, None).await;
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-    let stream_base = format!("http://127.0.0.1:{port}/torrents/{torrent_id}/stream");
-    push_log(shared, format!("[STREAM] Loopback Range server active at {stream_base}"));
-
-    let vfs = TorrentStreamFs::new(stream_base, virtual_files.clone())?;
-
-    // Prime FreeArc / 7z EOF footers (last 16 MB) before mounting & unpacking
+    // Prime FreeArc / 7z EOF footers (last 16 MB) directly via FileStream
     if detected_fmt.needs_eof_tail_prime() {
         set_progress(shared, None, None, Some("Priming EOF archive footers (16 MB tail)..."));
         for entry in &detected_entries {
             if entry.selected && entry.is_archive {
                 if let Some(fid) = entry.torrent_file_idx {
                     push_log(shared, format!("[PRIME] Fetching EOF footer for {}", entry.rel_path));
-                    let _ = vfs.prime_eof_footer(fid, entry.size_bytes);
+                    let _ = vfs.prime_eof_footer(fid, entry.size_bytes).await;
                 }
             }
         }
     }
 
-    // Mount WinFsp virtual drive Z:\ and run the exact same universal turbo unpacker over it
     push_log(shared, format!("[VFS] Mounting WinFsp virtual drive at {}\\", cfg.virtual_drive));
     let mut host = stream_bridge::mount_virtual_drive(&cfg.virtual_drive, vfs)?;
     let mount_root = PathBuf::from(format!("{}\\", cfg.virtual_drive));
@@ -259,8 +248,13 @@ async fn run_torrent_stream_pipeline(
     let mut live_cfg = cfg.clone();
     live_cfg.detected_format = detected_fmt;
     live_cfg.selected_files = detected_entries;
+    let shared_clone = shared.clone();
 
-    let unpack_result = run_local_turbo_pipeline(&live_cfg, &mount_root, shared);
+    // Run blocking unpacker on a dedicated thread so Tokio workers stay free for FileStream I/O
+    let unpack_result = tokio::task::spawn_blocking(move || {
+        run_local_turbo_pipeline(&live_cfg, &mount_root, &shared_clone)
+    })
+    .await?;
 
     host.stop();
     host.unmount();
@@ -306,13 +300,11 @@ pub fn run_local_turbo_pipeline(
     };
     push_log(shared, format!("[ENGINE] Format: {} | Source: {}", fmt.badge(), source_root.display()));
 
-    // Find setup.exe if present
     let setup_exe = scanned_entries
         .iter()
         .find(|e| e.is_setup_exe)
         .map(|e| resolve_source_file(source_root, &e.rel_path));
 
-    // Step 1: GOG Pure Inno Fast-Path
     if fmt == RepackFormat::GogPureInno {
         if let Some(setup) = &setup_exe {
             if innoextract.exists() {
@@ -330,7 +322,6 @@ pub fn run_local_turbo_pipeline(
         }
     }
 
-    // Step 2: Dissect Inno Setup {tmp} payload (FreeArc plugins + arc.ini + install_script.iss)
     let mut dissected = dissect::DissectedSetup::default();
     if let Some(setup) = &setup_exe {
         if innounp.exists() {
@@ -353,7 +344,6 @@ pub fn run_local_turbo_pipeline(
         }
     }
 
-    // Step 3: Collect selected archives & route each by magic bytes (handles ALL repack formats)
     let archives: Vec<PathBuf> = scanned_entries
         .iter()
         .filter(|e| e.selected && e.is_archive)
@@ -362,7 +352,6 @@ pub fn run_local_turbo_pipeline(
         .collect();
 
     if archives.is_empty() {
-        // Generic NSIS / InstallShield / Direct SFX fallback with Turbo env
         if let Some(setup) = setup_exe {
             set_progress(shared, None, Some(0.25), Some("Running Generic Setup in High-Priority Turbo Mode..."));
             push_log(shared, format!("[FALLBACK] Launching {} with Defender bypass + SSD TEMP", setup.display()));
@@ -391,7 +380,6 @@ pub fn run_local_turbo_pipeline(
 
         match magic {
             ArchiveMagic::FreeArc | ArchiveMagic::Unknown if unarc.exists() && (dissected.has_unarc_payload || fmt != RepackFormat::SceneArchiveOrIso) => {
-                // Ensure unarc.exe runs inside work_dir so it loads the repack's own cls-srep/cls-lolz/xtool DLLs
                 let local_unarc = work_dir.join("unarc.exe");
                 if !local_unarc.exists() {
                     let _ = std::fs::copy(&unarc, &local_unarc);
@@ -416,7 +404,7 @@ pub fn run_local_turbo_pipeline(
                         setup.display().to_string(),
                     ];
                     run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, start_p, end_p)?;
-                    break; // innoextract processes all slices from setup.exe automatically
+                    break;
                 }
             }
             ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip | ArchiveMagic::Iso9660 | ArchiveMagic::Unknown => {
@@ -434,7 +422,6 @@ pub fn run_local_turbo_pipeline(
         }
     }
 
-    // Step 4: Replay [Registry] and safe [Run] post-install tasks from install_script.iss
     if cfg.replay_registry && !dissected.registry_entries.is_empty() {
         set_progress(shared, None, Some(0.95), Some("Applying game registry entries..."));
         let count = dissect::apply_registry_entries(&dissected.registry_entries, &cfg.target_game_dir);
@@ -468,7 +455,6 @@ fn resolve_source_file(source_root: &Path, rel_path: &str) -> PathBuf {
     if direct.exists() {
         return direct;
     }
-    // Flat virtual mount fallback (Z:\fg-01.bin)
     if let Some(fname) = Path::new(rel_path).file_name() {
         let flat = source_root.join(fname);
         if flat.exists() {

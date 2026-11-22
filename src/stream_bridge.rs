@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
-use reqwest::header::RANGE;
+use librqbit::{Api, FileStream};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::io::SeekFrom;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::runtime::Handle;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     WideNameInfo,
@@ -19,23 +20,30 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 #[derive(Clone, Debug)]
 pub struct VirtualTorrentFile {
     pub file_id: usize,
-    pub virtual_name: String, // Flat or relative path inside Z:\
+    pub virtual_name: String,
     pub size: u64,
 }
 
 pub struct TorrentStreamFs {
-    pub base_stream_url: String, // e.g. "http://127.0.0.1:49210/torrents/0/stream"
-    pub client: Client,
+    pub api: Arc<Api>,
+    pub torrent_id: usize,
+    pub rt: Handle,
     pub files: Arc<HashMap<String, VirtualTorrentFile>>,
     pub dir_buffer: DirBuffer,
 }
 
 pub struct OpenVirtualHandle {
-    pub file: Option<VirtualTorrentFile>, // None => root directory
+    pub file: Option<VirtualTorrentFile>,
+    pub stream: Option<Mutex<FileStream>>,
 }
 
 impl TorrentStreamFs {
-    pub fn new(base_stream_url: String, entries: Vec<VirtualTorrentFile>) -> Result<Self> {
+    pub fn new(
+        api: Arc<Api>,
+        torrent_id: usize,
+        rt: Handle,
+        entries: Vec<VirtualTorrentFile>,
+    ) -> Self {
         let mut map = HashMap::new();
         for f in entries {
             let key = f
@@ -46,36 +54,40 @@ impl TorrentStreamFs {
             map.insert(key, f);
         }
 
-        // Long timeout so slow torrent peers never trigger a premature HTTP read error.
-        let client = Client::builder()
-            .timeout(Duration::from_secs(540))
-            .pool_max_idle_per_host(16)
-            .build()?;
-
-        Ok(Self {
-            base_stream_url,
-            client,
+        Self {
+            api,
+            torrent_id,
+            rt,
             files: Arc::new(map),
             dir_buffer: DirBuffer::new(),
-        })
+        }
     }
 
-    /// Pre-fetches the final 16 MB of a FreeArc (.bin / .doi) or 7z/ZIP archive
-    /// so unarc.exe reads the EOF directory footer instantaneously without stalling.
-    pub fn prime_eof_footer(&self, file_id: usize, total_size: u64) -> Result<()> {
+    /// Pre-fetches the final 16 MB of a FreeArc (.bin / .doi) or 7z/ZIP archive directly
+    /// through librqbit's FileStream so unarc.exe reads the EOF directory footer immediately.
+    pub async fn prime_eof_footer(&self, file_id: usize, total_size: u64) -> Result<()> {
         if total_size == 0 {
             return Ok(());
         }
         let tail = 16 * 1024 * 1024u64;
         let start = total_size.saturating_sub(tail);
-        let end = total_size.saturating_sub(1);
-        let url = format!("{}/{}", self.base_stream_url, file_id);
-        let _ = self
-            .client
-            .get(&url)
-            .header(RANGE, format!("bytes={start}-{end}"))
-            .send()
-            .with_context(|| format!("EOF tail-prime failed for file_id={file_id}"))?;
+        let mut stream = self
+            .api
+            .api_stream(self.torrent_id.into(), file_id)
+            .await
+            .with_context(|| format!("Failed to open FileStream for file_id={file_id}"))?;
+
+        stream.seek(SeekFrom::Start(start)).await?;
+        let mut scratch = vec![0u8; 256 * 1024];
+        let mut remaining = total_size - start;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(scratch.len());
+            let n = stream.read(&mut scratch[..to_read]).await?;
+            if n == 0 {
+                break;
+            }
+            remaining -= n as u64;
+        }
         Ok(())
     }
 
@@ -123,15 +135,25 @@ impl FileSystemContext for TorrentStreamFs {
         let path = file_name.to_string_lossy();
         if path == "\\" || path.is_empty() {
             file_info.as_mut().file_attributes = FILE_ATTRIBUTE_DIRECTORY;
-            return Ok(OpenVirtualHandle { file: None });
+            return Ok(OpenVirtualHandle {
+                file: None,
+                stream: None,
+            });
         }
         if let Some(vf) = self.lookup(file_name) {
             let fi = file_info.as_mut();
             fi.file_attributes = FILE_ATTRIBUTE_READONLY;
             fi.file_size = vf.size;
             fi.allocation_size = (vf.size + 4095) & !4095;
+
+            let stream = self
+                .rt
+                .block_on(self.api.api_stream(self.torrent_id.into(), vf.file_id))
+                .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+
             Ok(OpenVirtualHandle {
                 file: Some(vf.clone()),
+                stream: Some(Mutex::new(stream)),
             })
         } else {
             Err(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))
@@ -151,31 +173,38 @@ impl FileSystemContext for TorrentStreamFs {
         Ok(())
     }
 
-    /// Blocks transparently until librqbit fetches and SHA-1 verifies the requested byte range.
+    /// Reads directly from librqbit's in-process FileStream, blocking transparently
+    /// until requested torrent pieces are downloaded and SHA-1 verified.
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> FspResult<u32> {
-        let Some(vf) = &context.file else {
+        let (Some(vf), Some(stream_mtx)) = (&context.file, &context.stream) else {
             return Ok(0);
         };
         if offset >= vf.size || buffer.is_empty() {
             return Ok(0);
         }
-        let end = (offset + buffer.len() as u64 - 1).min(vf.size - 1);
-        let url = format!("{}/{}", self.base_stream_url, vf.file_id);
 
-        let resp = self
-            .client
-            .get(&url)
-            .header(RANGE, format!("bytes={offset}-{end}"))
-            .send()
+        let target_len = ((vf.size - offset) as usize).min(buffer.len());
+        let mut stream = stream_mtx
+            .lock()
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
-        let bytes = resp
-            .bytes()
+        let read_total = self
+            .rt
+            .block_on(async {
+                stream.seek(SeekFrom::Start(offset)).await?;
+                let mut filled = 0usize;
+                while filled < target_len {
+                    let n = stream.read(&mut buffer[filled..target_len]).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                Ok::<usize, std::io::Error>(filled)
+            })
             .map_err(|_| FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
 
-        let n = bytes.len().min(buffer.len());
-        buffer[..n].copy_from_slice(&bytes[..n]);
-        Ok(n as u32)
+        Ok(read_total as u32)
     }
 
     fn read_directory(
@@ -218,7 +247,7 @@ pub fn mount_virtual_drive(
         .sector_size(4096)
         .sectors_per_allocation_unit(1)
         .max_component_length(255)
-        .irp_timeout(600_000) // 10 minutes max IRP wait
+        .irp_timeout(600_000)
         .file_info_timeout(5_000);
 
     let mut host = FileSystemHost::new(params, fs)

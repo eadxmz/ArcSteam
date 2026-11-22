@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -18,8 +22,12 @@ jobs:
       - name: Install Rust Stable (2024 edition)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo Crates
+      - name: Cache Cargo Registry & Target Build Artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "arcsteam-win-x64-v1"
+          cache-all-crates: true
+          save-if: ${{ always() }}
 
       - name: Build Release Binary
         run: cargo build --release

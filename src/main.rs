@@ -169,7 +169,7 @@ impl eframe::App for ArcSteamApp {
             ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             // Header with SVG Logo & Mode Switcher
             ui.horizontal(|ui| {
                 ui.add(
