@@ -70,13 +70,11 @@ pub fn dissect_inno_setup(
 
     let tmp_sub = work_dir.join("{tmp}");
     if tmp_sub.is_dir() {
-        if let Ok(read_dir) = fs::read_dir(&tmp_sub) {
-            for entry in read_dir.flatten() {
+        for entry in walkdir::WalkDir::new(&tmp_sub).into_iter().flatten() {
+            if entry.file_type().is_file() {
                 let src = entry.path();
-                if src.is_file() {
-                    if let Some(name) = src.file_name() {
-                        let _ = fs::copy(&src, work_dir.join(name));
-                    }
+                if let Some(name) = src.file_name() {
+                    let _ = fs::copy(src, work_dir.join(name));
                 }
             }
         }

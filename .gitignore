@@ -1,4 +1,5 @@
 /target
+/bundled_tools
 /tools/*.exe
 /tools/*.dll
 Cargo.lock

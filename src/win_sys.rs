@@ -64,6 +64,23 @@ pub fn is_winfsp_installed() -> bool {
         || Path::new(r"C:\Program Files\WinFsp\bin\winfsp-x64.dll").exists()
 }
 
+
+/// Opens a web URL in the user's default browser.
+pub fn open_url(url: &str) {
+    let verb = to_wide("open");
+    let target = to_wide(url);
+    unsafe {
+        ShellExecuteW(
+            0,
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 /// Opens a folder or file in Windows Explorer.
 pub fn open_in_explorer(path: &Path) {
     let _ = std::fs::create_dir_all(path);

@@ -1,5 +1,6 @@
 use crate::detect::{self, ArchiveMagic, RepackFileEntry, RepackFormat};
 use crate::dissect;
+use crate::embedded_tools;
 use crate::optimizer::{self, DefenderExclusionGuard};
 use crate::stream_bridge::{self, TorrentStreamFs, VirtualTorrentFile};
 use crate::win_sys::{self, JobHandle, KeepAwakeGuard, PostQueueAction};
@@ -150,6 +151,7 @@ fn set_progress(
     }
 }
 
+#[allow(dead_code)]
 pub fn tools_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -457,11 +459,11 @@ pub fn run_local_turbo_pipeline(
     control: &Arc<PipelineControl>,
     job_start: Instant,
 ) -> Result<()> {
-    let tools = tools_dir();
-    let innounp = tools.join("innounp.exe");
-    let unarc = tools.join("unarc.exe");
-    let innoextract = tools.join("innoextract.exe");
-    let seven_zip = tools.join("7z.exe");
+    let tools = embedded_tools::bin_dir();
+    let innounp = embedded_tools::resolve_tool("innounp.exe");
+    let unarc = embedded_tools::resolve_tool("unarc.exe");
+    let innoextract = embedded_tools::resolve_tool("innoextract.exe");
+    let seven_zip = embedded_tools::resolve_tool("7z.exe");
 
     std::fs::create_dir_all(&cfg.fast_temp_dir)?;
     std::fs::create_dir_all(&cfg.target_game_dir)?;

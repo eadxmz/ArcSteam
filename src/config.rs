@@ -19,13 +19,27 @@ pub struct AppConfig {
     pub post_queue_action: PostQueueAction,
 }
 
+fn default_downloads_cache() -> PathBuf {
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile).join("Downloads").join("ArcSteam");
+    }
+    PathBuf::from(r"C:\ArcSteam\Downloads")
+}
+
+fn default_temp_dir() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local).join("ArcSteam").join("Temp");
+    }
+    PathBuf::from(r"C:\ArcSteam\Temp")
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            local_source: PathBuf::from(r"G:\Setup (After NEET)"),
-            download_cache_dir: PathBuf::from(r"G:\ArcSteamCache"),
-            temp_ssd_dir: PathBuf::from(r"C:\ArcSteamTemp"),
-            target_game_dir: PathBuf::from(r"D:\Games"),
+            local_source: PathBuf::new(),
+            download_cache_dir: default_downloads_cache(),
+            temp_ssd_dir: default_temp_dir(),
+            target_game_dir: PathBuf::from(r"C:\Games"),
             virtual_drive: "Z:".into(),
             live_install_while_dl: true,
             defender_bypass: true,
@@ -53,14 +67,27 @@ impl AppConfig {
         let Ok(content) = fs::read_to_string(config_path()) else {
             return cfg;
         };
+        let mut migrated = false;
         for line in content.lines() {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
             let val = v.trim();
             match k.trim() {
-                "local_source" if !val.is_empty() => cfg.local_source = PathBuf::from(val),
-                "download_cache_dir" if !val.is_empty() => cfg.download_cache_dir = PathBuf::from(val),
+                "local_source" if !val.is_empty() => {
+                    if val.to_ascii_lowercase().contains("after neet") {
+                        migrated = true;
+                    } else {
+                        cfg.local_source = PathBuf::from(val);
+                    }
+                }
+                "download_cache_dir" if !val.is_empty() => {
+                    if val.eq_ignore_ascii_case(r"G:\ArcSteamCache") {
+                        migrated = true;
+                    } else {
+                        cfg.download_cache_dir = PathBuf::from(val);
+                    }
+                }
                 "temp_ssd_dir" if !val.is_empty() => cfg.temp_ssd_dir = PathBuf::from(val),
                 "target_game_dir" if !val.is_empty() => cfg.target_game_dir = PathBuf::from(val),
                 "virtual_drive" if !val.is_empty() => cfg.virtual_drive = val.to_string(),
@@ -77,6 +104,9 @@ impl AppConfig {
                 "post_queue_action" => cfg.post_queue_action = PostQueueAction::parse(val),
                 _ => {}
             }
+        }
+        if migrated {
+            cfg.save();
         }
         cfg
     }

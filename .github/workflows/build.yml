@@ -19,22 +19,69 @@ jobs:
         shell: pwsh
         run: choco install winfsp -y --install-arguments="ADDLOCAL=ALL"
 
+      - name: Bundle Helper Binaries (Single-EXE Standalone Packaging)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path bundled_tools | Out-Null
+          New-Item -ItemType Directory -Force -Path _dl | Out-Null
+
+          # 1. 7-Zip CLI (preinstalled on windows-latest)
+          Copy-Item "C:\Program Files\7-Zip\7z.exe" "bundled_tools\7z.exe" -Force
+          Copy-Item "C:\Program Files\7-Zip\7z.dll" "bundled_tools\7z.dll" -Force
+
+          # 2. innoextract (Inno Setup up to 6.7.0, with official 1.9 fallback)
+          try {
+            $rel = Invoke-RestMethod "https://api.github.com/repos/UserUnknownFactor/innoextract_win/releases/latest"
+            $asset = $rel.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+            Invoke-WebRequest $asset.browser_download_url -OutFile "_dl\innoextract.zip"
+          } catch {
+            Invoke-WebRequest "https://github.com/dscharrer/innoextract/releases/download/1.9/innoextract-1.9-windows.zip" -OutFile "_dl\innoextract.zip"
+          }
+          Expand-Archive "_dl\innoextract.zip" -DestinationPath "_dl\innoextract" -Force
+          $inno = Get-ChildItem "_dl\innoextract" -Recurse -Filter "innoextract.exe" | Select-Object -First 1
+          Copy-Item $inno.FullName "bundled_tools\innoextract.exe" -Force
+
+          # 3. innounp-2 (Inno Setup up to 7.1.1, with v0.50 fallback)
+          try {
+            Invoke-WebRequest "https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/master/innounp-2/innounp-2.zip" -OutFile "_dl\innounp.zip"
+            Expand-Archive "_dl\innounp.zip" -DestinationPath "_dl\innounp" -Force
+            $iu = Get-ChildItem "_dl\innounp" -Recurse -Filter "innounp*.exe" | Select-Object -First 1
+            Copy-Item $iu.FullName "bundled_tools\innounp.exe" -Force
+          } catch {
+            Invoke-WebRequest "https://github.com/WhatTheBlock/innounp/releases/download/v0.50/innounp.exe" -OutFile "bundled_tools\innounp.exe"
+          }
+
+          # 4. unarc.exe (FreeArc CLI from UniExtract2 release, with FreeArc installer fallback)
+          try {
+            Invoke-WebRequest "https://github.com/Bioruebe/UniExtract2/releases/download/v2.0.0-rc.3/UniExtractRC3.zip" -OutFile "_dl\uniextract.zip"
+            & "C:\Program Files\7-Zip\7z.exe" e "_dl\uniextract.zip" -o"_dl\unarc" "unarc.exe" -r -y | Out-Null
+          } catch {
+            Invoke-WebRequest "https://downloads.sourceforge.net/project/freearc/FreeArc/FreeArc%200.666/FreeArc-0.666-win32.exe" -OutFile "_dl\freearc.exe"
+            & "C:\Program Files\7-Zip\7z.exe" e "_dl\freearc.exe" -o"_dl\unarc" "unarc.exe" -r -y | Out-Null
+          }
+          $ua = Get-ChildItem "_dl\unarc" -Recurse -Filter "unarc.exe" | Select-Object -First 1
+          if (-not $ua) { throw "Failed to locate unarc.exe" }
+          Copy-Item $ua.FullName "bundled_tools\unarc.exe" -Force
+
+          Remove-Item -Recurse -Force _dl
+          Write-Host "Bundled helper binaries ready for embedding:"
+          Get-ChildItem bundled_tools | Format-Table Name, Length -AutoSize
+
       - name: Install Rust Stable (2024 edition)
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo Registry & Target Build Artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "arcsteam-win-x64-v1"
+          shared-key: "arcsteam-win-x64-v2"
           cache-all-crates: true
 
-      - name: Build Release Binary
+      - name: Build Standalone Release Binary
         run: cargo build --release
 
-      - name: Upload arcsteam.exe
+      - name: Upload Standalone arcsteam.exe
         uses: actions/upload-artifact@v4
         with:
           name: ArcSteam-Windows-x64
-          path: |
-            target/release/arcsteam.exe
-            tools/README.txt
+          path: target/release/arcsteam.exe
