@@ -4,16 +4,29 @@ use std::path::PathBuf;
 fn main() {
     winfsp::build::winfsp_link_delayload();
 
-    // 1. Embed Windows .exe icon (Explorer / Taskbar / Shortcuts)
+    // 1. Embed Windows .exe icon + requireAdministrator UAC manifest
+    //    (required by FitGirl/DODI CLS plugins like cls-magic2l/cls-srep for Global\ shared memory,
+    //     plus automatic Defender Boost & WinFsp virtual drive mounting)
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    let mut res = winresource::WindowsResource::new();
     if std::path::Path::new("assets/icon.ico").exists() {
-        let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
-        res.set("ProductName", "ArcSteam");
-        res.set("FileDescription", "ArcSteam — Live Stream & Turbo Repack Installer");
-        if let Err(e) = res.compile() {
-            println!("cargo:warning=Failed to compile Windows icon resource: {e}");
-        }
+    }
+    res.set("ProductName", "ArcSteam");
+    res.set("FileDescription", "ArcSteam — Live Stream & Turbo Repack Installer");
+    res.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>"#,
+    );
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=Failed to compile Windows resource/manifest: {e}");
     }
 
     // 2. Embed any helper binaries placed in bundled_tools/ directly into arcsteam.exe
@@ -39,7 +52,6 @@ fn main() {
                 path.file_name().and_then(|n| n.to_str()),
                 fs::canonicalize(&path),
             ) {
-                // Strip \\?\ extended prefix if present so include_bytes! stays clean
                 let clean = canon.display().to_string();
                 let clean = clean.strip_prefix(r"\\?\").unwrap_or(&clean);
                 entries.push_str(&format!(

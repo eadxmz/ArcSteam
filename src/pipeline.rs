@@ -480,6 +480,9 @@ pub fn run_local_turbo_pipeline(
     std::fs::create_dir_all(&cfg.target_game_dir)?;
 
     let work_dir = cfg.fast_temp_dir.join("arcsteam_work");
+    if work_dir.exists() {
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
     std::fs::create_dir_all(&work_dir)?;
 
     let _defender_guard = if cfg.defender_bypass {

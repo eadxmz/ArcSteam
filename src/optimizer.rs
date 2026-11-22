@@ -217,15 +217,18 @@ pub fn patch_unpacker_configs(
         }
     };
 
+    let mut temp_with_slash = fast_temp_dir.display().to_string();
+    if !temp_with_slash.ends_with('\\') {
+        temp_with_slash.push('\\');
+    }
+
     let srep_cfg = if let Some(ref exe64) = external_srep64 {
         format!(
-            "[srep]\nMemory={effective_ram_mb}m\nTempPath={}\nExe={exe64}\n",
-            fast_temp_dir.display()
+            "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\nExe={exe64}\n"
         )
     } else {
         format!(
-            "[srep]\nMemory={effective_ram_mb}m\nTempPath={}\n",
-            fast_temp_dir.display()
+            "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\n"
         )
     };
     fs::write(work_dir.join("cls-srep.ini"), &srep_cfg)?;
