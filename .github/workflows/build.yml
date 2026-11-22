@@ -27,7 +27,6 @@ jobs:
         with:
           shared-key: "arcsteam-win-x64-v1"
           cache-all-crates: true
-          save-if: ${{ always() }}
 
       - name: Build Release Binary
         run: cargo build --release
