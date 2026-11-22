@@ -686,7 +686,7 @@ impl eframe::App for ArcSteamApp {
         // ===================================================================
         // 1. PINNED TOP GLASS NAVBAR (always visible, never scrolls off)
         // ===================================================================
-        egui::TopBottomPanel::top("arcsteam_top_nav")
+        egui::Panel::top("arcsteam_top_nav")
             .frame(Frame::NONE.inner_margin(Margin {
                 left: 20,
                 right: 20,
@@ -735,7 +735,7 @@ impl eframe::App for ArcSteamApp {
         // ===================================================================
         // 2. PINNED BOTTOM STATUS CAPSULE (always visible, never clipped)
         // ===================================================================
-        egui::TopBottomPanel::bottom("arcsteam_bottom_bar")
+        egui::Panel::bottom("arcsteam_bottom_bar")
             .frame(Frame::NONE.inner_margin(Margin {
                 left: 20,
                 right: 20,
