@@ -351,3 +351,70 @@ pub fn install_embedded_winfsp(msi_path: &Path) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+/// RAII guard that switches Windows to the High Performance power plan while unpacking
+/// to prevent CPU frequency scaling/core parking between compression blocks, then restores
+/// the previous scheme cleanly on exit or cancel.
+pub struct HighPerformanceGuard {
+    prev_guid: Option<String>,
+}
+
+impl HighPerformanceGuard {
+    pub fn activate() -> Self {
+        let prev_guid = Command::new("powercfg")
+            .args(["/getactivescheme"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .and_then(|out| {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let re = regex::Regex::new(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                )
+                .ok()?;
+                re.find(&s).map(|m| m.as_str().to_string())
+            });
+
+        const HIGH_PERF_GUID: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+        let ok = Command::new("powercfg")
+            .args(["/setactive", HIGH_PERF_GUID])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if ok {
+            Self { prev_guid }
+        } else {
+            Self { prev_guid: None }
+        }
+    }
+}
+
+impl Drop for HighPerformanceGuard {
+    fn drop(&mut self) {
+        if let Some(ref guid) = self.prev_guid {
+            let _ = Command::new("powercfg")
+                .args(["/setactive", guid])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+    }
+}
+
+/// Checks whether essential 32-bit legacy game runtimes (DirectX June 2010 & VC++ 2010 x86)
+/// are present in C:\Windows\SysWOW64. Missing these causes splash-screen hangs (Far Cry 3)
+/// or 0xc0000142 startup crashes on modern Windows 10/11 installs.
+pub fn check_legacy_game_runtimes() -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    let wow64 = Path::new(r"C:\Windows\SysWOW64");
+    if wow64.is_dir() {
+        if !wow64.join("d3dx9_43.dll").exists() || !wow64.join("d3dx11_43.dll").exists() {
+            missing.push("DirectX End-User Runtime (June 2010) [d3dx9_43.dll / d3dx11_43.dll]");
+        }
+        if !wow64.join("msvcr100.dll").exists() {
+            missing.push("Visual C++ 2010 x86 Runtime [msvcr100.dll]");
+        }
+    }
+    missing
+}

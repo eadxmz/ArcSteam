@@ -177,12 +177,6 @@ fn locate_and_stage_srep64(work_dir: &Path, tools_dir: &Path) -> Option<String> 
     None
 }
 
-/// Patches extracted CLS.ini, cls-srep.ini, and arc.ini in-place:
-/// - Rewrites ALL FitGirl/DODI placeholder paths (`TempPath={app}`, `TempPath={tmp}`, `{tmp}`)
-///   to point cleanly to the fastest SSD swap folder.
-/// - Replaces `fgrplc` placeholders in `arc.ini`.
-/// - Scales SREP RAM safely using 64-bit external workers or 32-bit OOM clamping.
-
 fn read_ini_lossy(path: &Path) -> String {
     let Ok(bytes) = fs::read(path) else {
         return String::new();
@@ -195,6 +189,70 @@ fn read_ini_lossy(path: &Path) -> String {
         return String::from_utf16_lossy(&u16s);
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Section-aware CLS.ini Turbo Optimizer:
+/// - Unlocks `MaxThreadsUsage=100%` across `[lolz]`, `[magic2]`, `[magic2l]`, `[srep]`
+/// - Bumps shared-memory IPC `transfer_ReadBufSize` / `transfer_WriteBufSize` to `4m`
+/// - Bumps `[srep]` `Bufsize` to `32m` and other CLS `Bufsize` to `4m`
+/// - Routes all `TempPath=` & `{app}`/`{tmp}` placeholders to the fastest SSD swap folder
+fn optimize_cls_ini_text(
+    raw: &str,
+    temp_with_slash: &str,
+    fast_temp_dir: &Path,
+    work_dir: &Path,
+    effective_ram_mb: u64,
+    threads: usize,
+) -> String {
+    let mut out = String::with_capacity(raw.len() + 256);
+    let mut section = String::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            section = trimmed.to_ascii_lowercase();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if let Some((key_raw, _val_raw)) = line.split_once('=') {
+            let key_lower = key_raw.trim().to_ascii_lowercase();
+            let rewritten = match key_lower.as_str() {
+                "temppath" => format!("{key_raw}={temp_with_slash}"),
+                "memory" => format!("{key_raw}={effective_ram_mb}m"),
+                "maxthreadsusage" => format!("{key_raw}=100%"),
+                "transfer_readbufsize" | "transfer_writebufsize" => format!("{key_raw}=4m"),
+                "bufsize" => {
+                    if section == "[srep]" {
+                        format!("{key_raw}=32m")
+                    } else {
+                        format!("{key_raw}=4m")
+                    }
+                }
+                _ => line
+                    .replace("{app}", &fast_temp_dir.display().to_string())
+                    .replace("{tmp}", &work_dir.display().to_string()),
+            };
+            out.push_str(&rewritten);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    let lower_all = out.to_ascii_lowercase();
+    if !lower_all.contains("[srep]") {
+        out.push_str(&format!(
+            "\n[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\nBufsize=32m\n"
+        ));
+    }
+    if !lower_all.contains("[lolz]") {
+        out.push_str(&format!(
+            "\n[lolz]\nMaxThreadsUsage=100%\nThreads={threads}\nTempPath={temp_with_slash}\nBufsize=4m\ntransfer_ReadBufSize=4m\ntransfer_WriteBufSize=4m\n"
+        ));
+    }
+    out
 }
 
 pub fn patch_unpacker_configs(
@@ -230,51 +288,31 @@ pub fn patch_unpacker_configs(
         temp_with_slash.push('\\');
     }
 
-    // 1. Write standalone cls-srep.ini fallback
     let srep_cfg = format!(
-        "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\n"
+        "[srep]\nMemory={effective_ram_mb}m\nTempPath={temp_with_slash}\nBufsize=32m\n"
     );
     fs::write(work_dir.join("cls-srep.ini"), &srep_cfg)?;
 
-    // 2. Patch repack's own CLS.ini in-place (preserving [magic2]/[magic2l]/[lolz] buffers)
     let cls_ini = if work_dir.join("CLS.ini").exists() {
         work_dir.join("CLS.ini")
     } else {
         work_dir.join("cls.ini")
     };
-
-    let mut cls_content = if cls_ini.exists() {
+    let raw_cls = if cls_ini.exists() {
         read_ini_lossy(&cls_ini)
     } else {
         String::new()
     };
+    let tuned_cls = optimize_cls_ini_text(
+        &raw_cls,
+        &temp_with_slash,
+        fast_temp_dir,
+        work_dir,
+        effective_ram_mb,
+        threads,
+    );
+    fs::write(&cls_ini, tuned_cls)?;
 
-    if !cls_content.is_empty() {
-        let re_temp = Regex::new(r"(?im)^(\s*TempPath\s*=).*$")?;
-        cls_content = re_temp
-            .replace_all(&cls_content, |caps: &regex::Captures| format!("{}{temp_with_slash}", &caps[1]))
-            .to_string();
-
-        let re_mem_line = Regex::new(r"(?im)^(\s*Memory\s*=).*$")?;
-        cls_content = re_mem_line
-            .replace_all(&cls_content, |caps: &regex::Captures| format!("{}{effective_ram_mb}m", &caps[1]))
-            .to_string();
-
-        cls_content = cls_content
-            .replace("{app}", &fast_temp_dir.display().to_string())
-            .replace("{tmp}", &work_dir.display().to_string());
-    }
-
-    if !cls_content.to_ascii_lowercase().contains("[srep]") {
-        cls_content.push('\n');
-        cls_content.push_str(&srep_cfg);
-    }
-    if !cls_content.to_ascii_lowercase().contains("[lolz]") {
-        cls_content.push_str(&format!("\n[lolz]\nMaxThreadsUsage={threads}\nTempPath={temp_with_slash}\n"));
-    }
-    fs::write(&cls_ini, cls_content)?;
-
-    // 3. Patch arc.ini placeholders (`fgrplc`, `{tmp}`, `-mem`, `-t`)
     let arc_ini = work_dir.join("arc.ini");
     if arc_ini.exists() {
         let mut text = read_ini_lossy(&arc_ini);

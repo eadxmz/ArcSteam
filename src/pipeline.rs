@@ -3,13 +3,13 @@ use crate::dissect;
 use crate::embedded_tools;
 use crate::optimizer::{self, DefenderExclusionGuard};
 use crate::stream_bridge::{self, TorrentStreamFs, VirtualTorrentFile};
-use crate::win_sys::{self, JobHandle, KeepAwakeGuard, PostQueueAction};
+use crate::win_sys::{self, HighPerformanceGuard, JobHandle, KeepAwakeGuard, PostQueueAction};
 use anyhow::{Context, Result};
 use librqbit::{AddTorrent, AddTorrentOptions, Api, Session};
 use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
@@ -169,6 +169,7 @@ pub fn spawn_queue_thread(
     control.reset();
     std::thread::spawn(move || {
         let _keep_awake = KeepAwakeGuard::activate();
+        let _high_perf = HighPerformanceGuard::activate();
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -610,146 +611,555 @@ pub fn run_local_turbo_pipeline(
         .iter()
         .map(|p| std::fs::metadata(p).map(|m| m.len().max(1)).unwrap_or(1))
         .collect();
-    let total_archive_bytes: f64 = archive_sizes.iter().sum::<u64>().max(1) as f64;
-    let mut cumulative_bytes: u64 = 0;
+    let total_archive_bytes: u64 = archive_sizes.iter().sum::<u64>().max(1);
+    let completed_bytes = Arc::new(AtomicU64::new(0));
     let unpack_clock = Instant::now();
     set_progress(shared, None, Some(0.0), None);
 
+    // Partition archives: heavy/primary or CLS-backed packs run solo at 100% threads + full RAM;
+    // smaller non-CLS secondary archives (< 600 MB) run 2-at-a-time in isolated worker directories.
+    let mut serial_items: Vec<(usize, PathBuf, u64, ArchiveMagic)> = Vec::new();
+    let mut parallel_items: Vec<(usize, PathBuf, u64, ArchiveMagic)> = Vec::new();
+    let allow_parallel = optimizer::logical_cpu_threads() >= 4;
+
     for (idx, archive_path) in archives.iter().enumerate() {
+        let sz = archive_sizes[idx];
+        let magic = detect::probe_archive_magic(archive_path);
+        let is_small_secondary = allow_parallel
+            && idx > 0
+            && sz < 600 * 1024 * 1024
+            && magic != ArchiveMagic::InnoSlice
+            && !archive_uses_cls(archive_path);
+
+        if is_small_secondary {
+            parallel_items.push((idx, archive_path.clone(), sz, magic));
+        } else {
+            serial_items.push((idx, archive_path.clone(), sz, magic));
+        }
+    }
+
+    // 1. Run primary / heavy / CLS archives sequentially
+    for (idx, archive_path, sz, magic) in serial_items {
         if control.cancel_requested.load(Ordering::Relaxed) {
             anyhow::bail!("Cancelled by user");
         }
-        let sz = archive_sizes[idx];
-        let start_p = (cumulative_bytes as f64 / total_archive_bytes) as f32 * 0.96;
-        cumulative_bytes += sz;
-        let end_p = (cumulative_bytes as f64 / total_archive_bytes) as f32 * 0.96;
-        let magic = detect::probe_archive_magic(archive_path);
+        let done_before = completed_bytes.load(Ordering::Relaxed);
+        let start_p = (done_before as f64 / total_archive_bytes as f64) as f32 * 0.96;
+        let end_p = ((done_before + sz) as f64 / total_archive_bytes as f64) as f32 * 0.96;
         let fname = archive_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        set_progress(shared, None, Some(start_p), Some(&format!("Unpacking {fname} ({}/{})", idx + 1, archives.len())));
+        set_progress(
+            shared,
+            None,
+            Some(start_p),
+            Some(&format!("Unpacking {fname} ({}/{})", idx + 1, archives.len())),
+        );
         push_log(shared, format!("[UNPACK] {fname} -> detected magic: {magic:?}"));
 
-        match magic {
-            ArchiveMagic::FreeArc => {
-                run_unarc_extract(
-                    &unarc,
-                    &work_dir,
-                    archive_path,
-                    &cfg.target_game_dir,
-                    &cfg.fast_temp_dir,
-                    dissected.archive_password.as_deref(),
-                    shared,
-                    control,
-                    unpack_clock,
-                    start_p,
-                    end_p,
-                    &fname,
-                )?;
-            }
-            ArchiveMagic::InnoSlice => {
-                if !innoextract.exists() {
-                    anyhow::bail!("tools/innoextract.exe is required to unpack Inno slice {fname}");
-                }
-                let setup = setup_exe.as_ref().with_context(|| {
-                    format!("Found Inno slice {fname} but no matching setup*.exe")
-                })?;
-                let args = vec![
-                    "-e".into(),
-                    "-d".into(),
-                    cfg.target_game_dir.display().to_string(),
-                    setup.display().to_string(),
-                ];
-                run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, control, unpack_clock, start_p, end_p)?;
-                break;
-            }
-            ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip | ArchiveMagic::Iso9660 => {
-                run_7z_extract(
-                    &seven_zip,
-                    archive_path,
-                    &cfg.target_game_dir,
-                    &cfg.fast_temp_dir,
-                    shared,
-                    control,
-                    unpack_clock,
-                    start_p,
-                    end_p,
-                    &fname,
-                )?;
-            }
-            ArchiveMagic::Unknown => {
-                if unarc.exists() && (dissected.has_unarc_payload || fmt != RepackFormat::SceneArchiveOrIso) {
-                    run_unarc_extract(
-                        &unarc,
-                        &work_dir,
-                        archive_path,
-                        &cfg.target_game_dir,
-                        &cfg.fast_temp_dir,
-                        dissected.archive_password.as_deref(),
-                        shared,
-                        control,
-                        unpack_clock,
-                        start_p,
-                        end_p,
-                        &fname,
-                    )?;
-                } else {
-                    run_7z_extract(
-                        &seven_zip,
-                        archive_path,
-                        &cfg.target_game_dir,
-                        &cfg.fast_temp_dir,
-                        shared,
-                        control,
-                        unpack_clock,
-                        start_p,
-                        end_p,
-                        &fname,
-                    )?;
-                }
-            }
+        let broke = extract_single_archive(
+            magic,
+            fmt,
+            dissected.has_unarc_payload,
+            dissected.archive_password.as_deref(),
+            &unarc,
+            &innoextract,
+            &seven_zip,
+            setup_exe.as_deref(),
+            &work_dir,
+            &archive_path,
+            &cfg.target_game_dir,
+            &cfg.fast_temp_dir,
+            shared,
+            control,
+            unpack_clock,
+            start_p,
+            end_p,
+            &fname,
+        )?;
+        completed_bytes.fetch_add(sz, Ordering::Relaxed);
+        if broke {
+            parallel_items.clear();
+            break;
         }
     }
 
-    if cfg.replay_registry && !dissected.registry_entries.is_empty() {
-        set_progress(shared, None, Some(0.95), Some("Applying game registry entries..."));
-        let count = dissect::apply_registry_entries(&dissected.registry_entries, &cfg.target_game_dir);
-        push_log(shared, format!("[REG] Applied {count} game registry key(s)."));
+    // 2. Run small non-CLS secondary archives 2-at-a-time in isolated worker folders
+    if parallel_items.len() >= 2 {
+        push_log(
+            shared,
+            format!(
+                "[TURBO] Unpacking {} small secondary archive(s) in parallel (2 workers)...",
+                parallel_items.len()
+            ),
+        );
+        for chunk in parallel_items.chunks(2) {
+            if control.cancel_requested.load(Ordering::Relaxed) {
+                anyhow::bail!("Cancelled by user");
+            }
+            let names: Vec<String> = chunk
+                .iter()
+                .map(|(_, p, _, _)| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            set_progress(
+                shared,
+                None,
+                None,
+                Some(&format!("Parallel unpacking: {}", names.join(" + "))),
+            );
+
+            let chunk_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+            std::thread::scope(|s| {
+                for (slot, (_idx, archive_path, sz, magic)) in chunk.iter().enumerate() {
+                    let completed_ref = completed_bytes.clone();
+                    let shared_ref = shared.clone();
+                    let ctrl_ref = control.clone();
+                    let err_ref = &chunk_err;
+                    let slot_work = cfg.fast_temp_dir.join(format!("arcsteam_work_p{slot}"));
+                    let slot_swap = cfg.fast_temp_dir.join(format!("arcsteam_swap_p{slot}"));
+                    let src_work = &work_dir;
+                    let unarc_ref = &unarc;
+                    let inno_ref = &innoextract;
+                    let sz7_ref = &seven_zip;
+                    let setup_ref = setup_exe.as_deref();
+                    let pwd_ref = dissected.archive_password.as_deref();
+                    let has_unarc = dissected.has_unarc_payload;
+                    let dst_ref = &cfg.target_game_dir;
+
+                    s.spawn(move || {
+                        let _ = copy_dir_flat(src_work, &slot_work);
+                        let _ = std::fs::create_dir_all(&slot_swap);
+                        let fname = archive_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let cur = completed_ref.load(Ordering::Relaxed);
+                        let sp = (cur as f64 / total_archive_bytes as f64) as f32 * 0.96;
+                        let ep = ((cur + *sz) as f64 / total_archive_bytes as f64) as f32 * 0.96;
+
+                        push_log(&shared_ref, format!("[PARALLEL-{slot}] Unpacking {fname}"));
+                        let res = extract_single_archive(
+                            *magic,
+                            fmt,
+                            has_unarc,
+                            pwd_ref,
+                            unarc_ref,
+                            inno_ref,
+                            sz7_ref,
+                            setup_ref,
+                            &slot_work,
+                            archive_path,
+                            dst_ref,
+                            &slot_swap,
+                            &shared_ref,
+                            &ctrl_ref,
+                            unpack_clock,
+                            sp,
+                            ep,
+                            &fname,
+                        );
+                        let _ = std::fs::remove_dir_all(&slot_work);
+                        let _ = std::fs::remove_dir_all(&slot_swap);
+
+                        match res {
+                            Ok(_) => {
+                                let new_done = completed_ref.fetch_add(*sz, Ordering::Relaxed) + *sz;
+                                let overall = (new_done as f64 / total_archive_bytes as f64) as f32 * 0.96;
+                                set_progress(&shared_ref, None, Some(overall), None);
+                            }
+                            Err(e) => {
+                                if let Ok(mut guard) = err_ref.lock() {
+                                    if guard.is_none() {
+                                        *guard = Some(e);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            if let Some(err) = chunk_err.into_inner().unwrap() {
+                return Err(err);
+            }
+        }
+    } else {
+        for (idx, archive_path, sz, magic) in parallel_items {
+            if control.cancel_requested.load(Ordering::Relaxed) {
+                anyhow::bail!("Cancelled by user");
+            }
+            let done_before = completed_bytes.load(Ordering::Relaxed);
+            let start_p = (done_before as f64 / total_archive_bytes as f64) as f32 * 0.96;
+            let end_p = ((done_before + sz) as f64 / total_archive_bytes as f64) as f32 * 0.96;
+            let fname = archive_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            set_progress(
+                shared,
+                None,
+                Some(start_p),
+                Some(&format!("Unpacking {fname} ({}/{})", idx + 1, archives.len())),
+            );
+            push_log(shared, format!("[UNPACK] {fname} -> detected magic: {magic:?}"));
+
+            let _ = extract_single_archive(
+                magic,
+                fmt,
+                dissected.has_unarc_payload,
+                dissected.archive_password.as_deref(),
+                &unarc,
+                &innoextract,
+                &seven_zip,
+                setup_exe.as_deref(),
+                &work_dir,
+                &archive_path,
+                &cfg.target_game_dir,
+                &cfg.fast_temp_dir,
+                shared,
+                control,
+                unpack_clock,
+                start_p,
+                end_p,
+                &fname,
+            )?;
+            completed_bytes.fetch_add(sz, Ordering::Relaxed);
+        }
     }
 
-    if cfg.create_shortcuts && !dissected.icon_entries.is_empty() {
-        let created = dissect::create_desktop_shortcuts(&dissected.icon_entries, &cfg.target_game_dir);
+    // 3. Finalize: deploy setup.exe embedded {app}/{userdocs} files, create [Dirs],
+    //    apply 32-bit WOW6432Node + 64-bit [Registry] keys, create shortcuts, run safe post-patchers
+    finalize_setup_metadata(
+        &dissected,
+        &work_dir,
+        &cfg.target_game_dir,
+        &cfg.fast_temp_dir,
+        cfg.replay_registry,
+        cfg.create_shortcuts,
+        shared,
+        Some(control),
+    )?;
+
+    cleanup_work_dir(cfg.auto_clean_temp, &work_dir, shared);
+    Ok(())
+}
+
+/// Replays setup.exe's embedded `{app}`/`{userdocs}` files, `[Dirs]`, 32/64-bit `[Registry]` keys,
+/// and checks required legacy DirectX/VC++ runtimes on an already-unpacked game folder in seconds.
+pub fn spawn_repair_existing_thread(
+    repack_dir: PathBuf,
+    target_game_dir: PathBuf,
+    fast_temp_dir: PathBuf,
+    shared: Arc<Mutex<SharedTelemetry>>,
+) {
+    std::thread::spawn(move || {
+        if let Ok(mut s) = shared.lock() {
+            s.running = true;
+            s.unpack_pct = 0.2;
+            s.stage_label = "Repairing game metadata & checking runtimes...".into();
+        }
+        let res = (|| -> Result<()> {
+            let innounp = embedded_tools::resolve_tool("innounp.exe");
+            let (_, entries) = detect::scan_local_directory(&repack_dir);
+            let setup_exe = entries
+                .iter()
+                .find(|e| e.is_setup_exe)
+                .map(|e| resolve_source_file(&repack_dir, &e.rel_path));
+
+            let work_dir = fast_temp_dir.join("arcsteam_repair_work");
+            if work_dir.exists() {
+                let _ = std::fs::remove_dir_all(&work_dir);
+            }
+            std::fs::create_dir_all(&work_dir)?;
+
+            if let Some(setup) = setup_exe {
+                if innounp.exists() {
+                    push_log(&shared, format!("[REPAIR] Dissecting {}", setup.display()));
+                    let dissected = dissect::dissect_inno_setup(&innounp, &setup, &work_dir)?;
+                    finalize_setup_metadata(
+                        &dissected,
+                        &work_dir,
+                        &target_game_dir,
+                        &fast_temp_dir,
+                        true,
+                        true,
+                        &shared,
+                        None,
+                    )?;
+                }
+            } else {
+                push_log(&shared, "[REPAIR] No setup.exe found — running runtime check only.");
+                log_missing_runtimes(&shared);
+            }
+            let _ = std::fs::remove_dir_all(&work_dir);
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => {
+                set_progress(&shared, None, Some(1.0), Some("Repair complete"));
+                push_log(&shared, "[DONE] Game metadata finalized & runtime check finished.");
+            }
+            Err(e) => {
+                set_progress(&shared, None, None, Some("Repair failed"));
+                push_log(&shared, format!("[ERROR] Repair failed: {e:#}"));
+            }
+        }
+        if let Ok(mut s) = shared.lock() {
+            s.running = false;
+        }
+    });
+}
+
+fn log_missing_runtimes(shared: &Arc<Mutex<SharedTelemetry>>) {
+    let missing = win_sys::check_legacy_game_runtimes();
+    for rt in missing {
+        push_log(
+            shared,
+            format!("[WARN] Missing required runtime: {rt} (can cause splash hangs or 0xc0000142 crashes)"),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_setup_metadata(
+    dissected: &dissect::DissectedSetup,
+    work_dir: &Path,
+    target_game_dir: &Path,
+    fast_temp_dir: &Path,
+    replay_registry: bool,
+    create_shortcuts: bool,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    control: Option<&Arc<PipelineControl>>,
+) -> Result<()> {
+    set_progress(shared, None, Some(0.96), Some("Deploying setup files, dirs & registry..."));
+
+    let embedded_copied = dissect::deploy_embedded_setup_files(work_dir, target_game_dir);
+    if embedded_copied > 0 {
+        push_log(
+            shared,
+            format!("[SETUP] Deployed {embedded_copied} embedded file(s) from setup.exe ({{app}}/{{userdocs}})."),
+        );
+    }
+
+    if !dissected.dir_entries.is_empty() {
+        let dir_count = dissect::create_script_dirs(&dissected.dir_entries, target_game_dir, work_dir);
+        if dir_count > 0 {
+            push_log(
+                shared,
+                format!("[DIRS] Created {dir_count} game/profile folder(s) from [Dirs]."),
+            );
+        }
+    }
+
+    if replay_registry && !dissected.registry_entries.is_empty() {
+        let count = dissect::apply_registry_entries(
+            &dissected.registry_entries,
+            target_game_dir,
+            work_dir,
+        );
+        push_log(
+            shared,
+            format!("[REG] Applied {count} game registry key(s) (32-bit WOW6432Node + 64-bit)."),
+        );
+    }
+
+    if create_shortcuts && !dissected.icon_entries.is_empty() {
+        let created = dissect::create_desktop_shortcuts(&dissected.icon_entries, target_game_dir);
         if created > 0 {
             push_log(shared, format!("[SHORTCUT] Created {created} Desktop shortcut(s)."));
         }
     }
 
     for post in &dissected.safe_post_run {
-        if control.cancel_requested.load(Ordering::Relaxed) {
-            anyhow::bail!("Cancelled by user");
+        if let Some(ctrl) = control {
+            if ctrl.cancel_requested.load(Ordering::Relaxed) {
+                anyhow::bail!("Cancelled by user");
+            }
         }
-        let exe_path = PathBuf::from(
-            post.filename
-                .replace("{app}", &cfg.target_game_dir.display().to_string())
-                .replace("{tmp}", &work_dir.display().to_string()),
-        );
+        let exe_path = PathBuf::from(dissect::expand_inno_tokens(
+            &post.filename,
+            target_game_dir,
+            work_dir,
+        ));
         if exe_path.exists() {
             push_log(shared, format!("[POST] Executing {}", exe_path.display()));
-            let params: Vec<String> = post
-                .parameters
-                .replace("{app}", &cfg.target_game_dir.display().to_string())
+            let params: Vec<String> = dissect::expand_inno_tokens(&post.parameters, target_game_dir, work_dir)
                 .split_whitespace()
                 .map(String::from)
                 .collect();
-            let _ = optimizer::spawn_turbo_process(&exe_path, &params, Some(&cfg.target_game_dir), &cfg.fast_temp_dir, false)
-                .and_then(|mut c| Ok(c.wait()?));
+            let _ = optimizer::spawn_turbo_process(
+                &exe_path,
+                &params,
+                Some(target_game_dir),
+                fast_temp_dir,
+                false,
+            )
+            .and_then(|mut c| Ok(c.wait()?));
         }
     }
 
-    cleanup_work_dir(cfg.auto_clean_temp, &work_dir, shared);
+    log_missing_runtimes(shared);
     Ok(())
+}
+
+/// Checks the last 256 KB descriptor of an archive for CLS external-codec signatures.
+/// CLS codecs share fixed named mappings and already multithread at 100%, so they run solo.
+fn archive_uses_cls(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return true;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return true;
+    };
+    let probe_len = len.min(256 * 1024) as usize;
+    let start = len.saturating_sub(probe_len as u64);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return true;
+    }
+    let mut buf = vec![0u8; probe_len];
+    if f.read_exact(&mut buf).is_err() {
+        return true;
+    }
+    let lower = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+    ["srep", "lolz", "magic2", "lolly", "xtool", "oodle", "oo2reck"]
+        .iter()
+        .any(|sig| lower.contains(sig))
+}
+
+fn copy_dir_flat(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_file() {
+            let _ = std::fs::copy(&p, dst.join(entry.file_name()));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_single_archive(
+    magic: ArchiveMagic,
+    fmt: RepackFormat,
+    has_unarc_payload: bool,
+    password: Option<&str>,
+    unarc: &Path,
+    innoextract: &Path,
+    seven_zip: &Path,
+    setup_exe: Option<&Path>,
+    work_dir: &Path,
+    archive_path: &Path,
+    target_game_dir: &Path,
+    fast_temp_dir: &Path,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    control: &Arc<PipelineControl>,
+    unpack_clock: Instant,
+    start_p: f32,
+    end_p: f32,
+    fname: &str,
+) -> Result<bool> {
+    match magic {
+        ArchiveMagic::FreeArc => {
+            run_unarc_extract(
+                unarc,
+                work_dir,
+                archive_path,
+                target_game_dir,
+                fast_temp_dir,
+                password,
+                shared,
+                control,
+                unpack_clock,
+                start_p,
+                end_p,
+                fname,
+            )?;
+            Ok(false)
+        }
+        ArchiveMagic::InnoSlice => {
+            if !innoextract.exists() {
+                anyhow::bail!("Built-in innoextract.exe is required to unpack Inno slice {fname}");
+            }
+            let setup = setup_exe.with_context(|| {
+                format!("Found Inno slice {fname} but no matching setup*.exe")
+            })?;
+            let args = vec![
+                "-e".into(),
+                "-d".into(),
+                target_game_dir.display().to_string(),
+                setup.display().to_string(),
+            ];
+            run_and_stream_logs(
+                innoextract,
+                &args,
+                None,
+                fast_temp_dir,
+                shared,
+                control,
+                unpack_clock,
+                start_p,
+                end_p,
+            )?;
+            Ok(true)
+        }
+        ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip | ArchiveMagic::Iso9660 => {
+            run_7z_extract(
+                seven_zip,
+                archive_path,
+                target_game_dir,
+                fast_temp_dir,
+                shared,
+                control,
+                unpack_clock,
+                start_p,
+                end_p,
+                fname,
+            )?;
+            Ok(false)
+        }
+        ArchiveMagic::Unknown => {
+            if unarc.exists() && (has_unarc_payload || fmt != RepackFormat::SceneArchiveOrIso) {
+                run_unarc_extract(
+                    unarc,
+                    work_dir,
+                    archive_path,
+                    target_game_dir,
+                    fast_temp_dir,
+                    password,
+                    shared,
+                    control,
+                    unpack_clock,
+                    start_p,
+                    end_p,
+                    fname,
+                )?;
+            } else {
+                run_7z_extract(
+                    seven_zip,
+                    archive_path,
+                    target_game_dir,
+                    fast_temp_dir,
+                    shared,
+                    control,
+                    unpack_clock,
+                    start_p,
+                    end_p,
+                    fname,
+                )?;
+            }
+            Ok(false)
+        }
+    }
 }
 
 fn cleanup_work_dir(enabled: bool, work_dir: &Path, shared: &Arc<Mutex<SharedTelemetry>>) {

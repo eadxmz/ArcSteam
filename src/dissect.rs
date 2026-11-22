@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::collections::HashSet;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use walkdir::WalkDir;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -11,6 +13,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub struct DissectedSetup {
     pub archive_password: Option<String>,
     pub registry_entries: Vec<RegistryEntry>,
+    pub dir_entries: Vec<String>,
     pub icon_entries: Vec<IconEntry>,
     pub safe_post_run: Vec<PostRunCommand>,
     pub has_unarc_payload: bool,
@@ -38,8 +41,60 @@ pub struct PostRunCommand {
     pub parameters: String,
 }
 
-/// Unpacks setup.exe's embedded {tmp} plugins (unarc.dll, cls-srep, cls-lolz, xtool, arc.ini)
-/// and parses install_script.iss for passwords, [Registry], [Icons], and safe [Run] tasks.
+fn env_dir(var: &str, fallback: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| fallback.to_string())
+}
+
+fn user_docs_dir() -> PathBuf {
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile).join("Documents");
+    }
+    PathBuf::from(r"C:\Users\Public\Documents")
+}
+
+fn common_docs_dir() -> PathBuf {
+    if let Some(public) = std::env::var_os("PUBLIC") {
+        return PathBuf::from(public).join("Documents");
+    }
+    PathBuf::from(r"C:\Users\Public\Documents")
+}
+
+/// Expands Inno Setup directory constants (`{app}`, `{userdocs}`, `{localappdata}`, etc.).
+pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> String {
+    let app_str = target_app_dir.display().to_string();
+    let tmp_str = work_dir.display().to_string();
+    let docs_str = user_docs_dir().display().to_string();
+    let cdocs_str = common_docs_dir().display().to_string();
+    let appdata = env_dir("APPDATA", r"C:\Users\Default\AppData\Roaming");
+    let localappdata = env_dir("LOCALAPPDATA", r"C:\Users\Default\AppData\Local");
+    let progdata = env_dir("PROGRAMDATA", r"C:\ProgramData");
+    let windir = env_dir("WINDIR", r"C:\Windows");
+    let sysdir = format!(r"{windir}\System32");
+
+    let mut out = raw.to_string();
+    let pairs = [
+        ("{app}", app_str.as_str()),
+        ("{APP}", app_str.as_str()),
+        ("{tmp}", tmp_str.as_str()),
+        ("{TMP}", tmp_str.as_str()),
+        ("{userdocs}", docs_str.as_str()),
+        ("{commondocs}", cdocs_str.as_str()),
+        ("{userappdata}", appdata.as_str()),
+        ("{localappdata}", localappdata.as_str()),
+        ("{commonappdata}", progdata.as_str()),
+        ("{win}", windir.as_str()),
+        ("{sys}", sysdir.as_str()),
+    ];
+    for (tok, val) in pairs {
+        if out.contains(tok) {
+            out = out.replace(tok, val);
+        }
+    }
+    out
+}
+
+/// Unpacks setup.exe's embedded files (`{tmp}`, `{app}`, `{userdocs}`, etc.)
+/// and parses `install_script.iss` for passwords, `[Dirs]`, `[Registry]`, `[Icons]`, and safe `[Run]` tasks.
 pub fn dissect_inno_setup(
     innounp_exe: &Path,
     setup_exe: &Path,
@@ -64,7 +119,8 @@ pub fn dissect_inno_setup(
         return Ok(result);
     }
 
-    for entry in walkdir::WalkDir::new(work_dir).max_depth(4).into_iter().flatten() {
+    // Flatten FreeArc/CLS plugins from `{tmp}` (or nested subdirs) into `work_dir`
+    for entry in WalkDir::new(work_dir).max_depth(4).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -72,7 +128,9 @@ pub fn dissect_inno_setup(
         if src.parent() == Some(work_dir) {
             continue;
         }
-        let Some(name_os) = src.file_name() else { continue };
+        let Some(name_os) = src.file_name() else {
+            continue;
+        };
         let lower = name_os.to_string_lossy().to_ascii_lowercase();
         let in_tmp = src
             .to_string_lossy()
@@ -106,12 +164,101 @@ pub fn dissect_inno_setup(
 
     let iss_path = work_dir.join("install_script.iss");
     if iss_path.exists() {
-        if let Ok(script) = fs::read_to_string(&iss_path) {
+        if let Ok(bytes) = fs::read(&iss_path) {
+            let script = if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+                let u16s: Vec<u16> = bytes[2..]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16_lossy(&u16s)
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
             parse_install_script(&script, &mut result);
         }
     }
 
     Ok(result)
+}
+
+fn copy_tree_filtered(src_root: &Path, dst_root: &Path) -> usize {
+    if !src_root.is_dir() {
+        return 0;
+    }
+    let mut copied = 0usize;
+    for entry in WalkDir::new(src_root).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let src = entry.path();
+        let Ok(rel) = src.strip_prefix(src_root) else {
+            continue;
+        };
+        let lower_name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if lower_name.starts_with("unins")
+            || lower_name.ends_with(".url")
+            || lower_name == "quicksfv.exe"
+            || lower_name == "quicksfv.ini"
+        {
+            continue;
+        }
+        let dst = dst_root.join(rel);
+        if let Some(parent) = dst.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::copy(src, &dst).is_ok() {
+            copied += 1;
+        }
+    }
+    copied
+}
+
+/// Copies embedded game/profile files extracted from `setup.exe` (`{app}`, `{userdocs}`,
+/// `{userappdata}`, `{localappdata}`, `{commonappdata}`) to their real Windows destinations.
+pub fn deploy_embedded_setup_files(work_dir: &Path, target_app_dir: &Path) -> usize {
+    let mut total = 0usize;
+    let mappings: [(&str, PathBuf); 6] = [
+        ("{app}", target_app_dir.to_path_buf()),
+        ("{userdocs}", user_docs_dir()),
+        ("{commondocs}", common_docs_dir()),
+        ("{userappdata}", PathBuf::from(env_dir("APPDATA", ""))),
+        ("{localappdata}", PathBuf::from(env_dir("LOCALAPPDATA", ""))),
+        ("{commonappdata}", PathBuf::from(env_dir("PROGRAMDATA", ""))),
+    ];
+
+    if let Ok(rd) = fs::read_dir(work_dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            for (token, dst) in &mappings {
+                if dir_name == *token && !dst.as_os_str().is_empty() {
+                    total += copy_tree_filtered(&path, dst);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Creates all directories declared in `install_script.iss` `[Dirs]` (e.g., `Documents\My Games\...`).
+pub fn create_script_dirs(dirs: &[String], target_app_dir: &Path, work_dir: &Path) -> usize {
+    let mut created = 0usize;
+    for raw in dirs {
+        let expanded = expand_inno_tokens(raw, target_app_dir, work_dir);
+        let p = PathBuf::from(expanded.trim());
+        if !p.as_os_str().is_empty() && !p.to_string_lossy().contains('{') {
+            if fs::create_dir_all(&p).is_ok() {
+                created += 1;
+            }
+        }
+    }
+    created
 }
 
 fn parse_install_script(script: &str, out: &mut DissectedSetup) {
@@ -143,7 +290,20 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
             continue;
         }
 
-        if section.eq_ignore_ascii_case("[Registry]") {
+        if section.eq_ignore_ascii_case("[Dirs]") {
+            for cap in re_kv.captures_iter(line) {
+                if cap[1].eq_ignore_ascii_case("name") {
+                    let v = cap
+                        .get(3)
+                        .or_else(|| cap.get(4))
+                        .map(|m| m.as_str().trim().to_string())
+                        .unwrap_or_default();
+                    if !v.is_empty() {
+                        out.dir_entries.push(v);
+                    }
+                }
+            }
+        } else if section.eq_ignore_ascii_case("[Registry]") {
             let mut root = String::new();
             let mut subkey = String::new();
             let mut value_type = String::from("string");
@@ -223,53 +383,88 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
                 }
             }
             let lower = filename.to_ascii_lowercase();
-            let is_safe_patcher = (lower.contains("xdelta")
-                || lower.contains("bink")
+            let is_blocked = lower.starts_with("http")
+                || lower.contains("vcredist")
+                || lower.contains("dxwebsetup")
+                || lower.contains("dxsetup")
+                || lower.contains("directx")
+                || lower.contains("dotnet")
+                || lower.contains("openal")
+                || lower.contains("physx")
+                || lower.contains("quicksfv")
+                || lower.contains("unins");
+            let is_safe_patcher = lower.contains("xdelta")
+                || lower.contains("hdiff")
                 || lower.contains("hpatch")
+                || lower.contains("vpatch")
+                || lower.contains("bsdiff")
+                || lower.contains("bink")
+                || lower.contains("radvideo")
                 || lower.contains("quickbms")
-                || lower.contains("unpack"))
-                && !lower.starts_with("http")
-                && !lower.contains("vcredist")
-                && !lower.contains("dxwebsetup");
+                || lower.contains("oggdec")
+                || lower.contains("flac")
+                || lower.contains("unpack")
+                || lower.contains("repack");
 
-            if is_safe_patcher {
+            if is_safe_patcher && !is_blocked {
                 out.safe_post_run.push(PostRunCommand { filename, parameters });
             }
         }
     }
 }
 
-pub fn apply_registry_entries(entries: &[RegistryEntry], target_app_dir: &Path) -> usize {
-    let app_str = target_app_dir.display().to_string();
-    let mut applied = 0;
+/// Applies `[Registry]` keys with proper 32-bit `WOW6432Node` (`/reg:32`) + 64-bit (`/reg:64`) routing
+/// so 32-bit games (e.g. Far Cry 3, Blood Dragon, older Ubisoft/EA titles) always see their keys.
+pub fn apply_registry_entries(
+    entries: &[RegistryEntry],
+    target_app_dir: &Path,
+    work_dir: &Path,
+) -> usize {
+    let mut applied = 0usize;
 
     for e in entries {
-        let hive = match e.root.to_ascii_uppercase().as_str() {
-            "HKLM" | "HKLM32" | "HKLM64" => "HKLM",
-            "HKCU" | "HKCU32" | "HKCU64" => "HKCU",
+        let upper_root = e.root.to_ascii_uppercase();
+        let (hive, reg_views): (&str, &[&str]) = match upper_root.as_str() {
+            "HKLM32" => ("HKLM", &["/reg:32"]),
+            "HKLM64" => ("HKLM", &["/reg:64"]),
+            "HKLM" => ("HKLM", &["/reg:32", "/reg:64"]),
+            "HKCU32" => ("HKCU", &["/reg:32"]),
+            "HKCU64" => ("HKCU", &["/reg:64"]),
+            "HKCU" => ("HKCU", &["/reg:32", "/reg:64"]),
             _ => continue,
         };
         let reg_type = match e.value_type.to_ascii_lowercase().as_str() {
             "dword" => "REG_DWORD",
             "expandsz" => "REG_EXPAND_SZ",
+            "none" => continue,
             _ => "REG_SZ",
         };
-        let key_path = format!(r"{hive}\{}", e.subkey.replace("{app}", &app_str));
-        let data = e.value_data.replace("{app}", &app_str);
-
-        let mut cmd = Command::new("reg");
-        cmd.args(["add", &key_path, "/t", reg_type, "/d", &data, "/f"]);
-        if e.value_name.is_empty() {
-            cmd.arg("/ve");
-        } else {
-            cmd.args(["/v", &e.value_name]);
+        let subkey = expand_inno_tokens(&e.subkey, target_app_dir, work_dir);
+        let key_path = format!(r"{hive}\{subkey}");
+        let mut data = expand_inno_tokens(&e.value_data, target_app_dir, work_dir);
+        if reg_type == "REG_DWORD" && data.starts_with('$') {
+            data = format!("0x{}", &data[1..]);
         }
-        if cmd
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
+
+        let mut wrote_any = false;
+        for &view in reg_views {
+            let mut cmd = Command::new("reg");
+            cmd.args(["add", &key_path, "/t", reg_type, "/d", &data, "/f", view]);
+            if e.value_name.is_empty() {
+                cmd.arg("/ve");
+            } else {
+                cmd.args(["/v", &e.value_name]);
+            }
+            if cmd
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                wrote_any = true;
+            }
+        }
+        if wrote_any {
             applied += 1;
         }
     }
@@ -280,7 +475,7 @@ pub fn apply_registry_entries(entries: &[RegistryEntry], target_app_dir: &Path) 
 pub fn create_desktop_shortcuts(icons: &[IconEntry], target_app_dir: &Path) -> usize {
     let app_str = target_app_dir.display().to_string();
     let mut created = 0usize;
-    let mut seen_targets = std::collections::HashSet::new();
+    let mut seen_targets = HashSet::new();
 
     for icon in icons {
         let exe_path = PathBuf::from(icon.filename.replace("{app}", &app_str));

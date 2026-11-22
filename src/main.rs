@@ -1271,6 +1271,46 @@ impl eframe::App for ArcSteamApp {
                                                         });
                                                         ui.add_space(14.0);
 
+                                                        // 1-Click Post-Install Finalizer & Runtime Check (fixes 0xc0000142 & splash hangs)
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            let can_repair = !running
+                                                                && !self.cfg.local_source.as_os_str().is_empty()
+                                                                && !self.cfg.target_game_dir.as_os_str().is_empty();
+                                                            if ui
+                                                                .add_enabled(
+                                                                    can_repair,
+                                                                    egui::Button::new("Replay setup.exe Metadata & Fix Launch"),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.show_logs = true;
+                                                                pipeline::spawn_repair_existing_thread(
+                                                                    self.cfg.local_source.clone(),
+                                                                    self.cfg.target_game_dir.clone(),
+                                                                    self.cfg.temp_ssd_dir.clone(),
+                                                                    self.telemetry.clone(),
+                                                                );
+                                                            }
+                                                            let missing_rt = win_sys::check_legacy_game_runtimes();
+                                                            if missing_rt.is_empty() {
+                                                                ui.label(
+                                                                    RichText::new("● DX9/11 & VC++ 2010 x86 Ready")
+                                                                        .size(11.5)
+                                                                        .color(OK_MINT),
+                                                                );
+                                                            } else {
+                                                                if ui.small_button("Get DirectX June 2010 >").clicked() {
+                                                                    win_sys::open_url("https://www.microsoft.com/en-us/download/details.aspx?id=8109");
+                                                                }
+                                                                if ui.small_button("Get VC++ AIO >").clicked() {
+                                                                    win_sys::open_url("https://www.techpowerup.com/download/visual-c-redistributable-runtime-package-all-in-one/");
+                                                                }
+                                                            }
+                                                        });
+                                                        ui.add_space(10.0);
+                                                        ui.separator();
+                                                        ui.add_space(10.0);
+
                                                         Self::input_row(
                                                             ui,
                                                             "Multi-Core MD5 / SFV File Verifier",
@@ -1339,7 +1379,7 @@ impl eframe::App for ArcSteamApp {
                                                         ui.add_space(6.0);
                                                         Self::input_row(
                                                             ui,
-                                                            "Zstd Backup File (.tar.zst — 500+ MB/s extract)",
+                                                            "Zstd LDM Vault (.tar.zst — 128 MB LDM • 500+ MB/s extract)",
                                                             &mut self.zstd_dst,
                                                             "Choose .tar.zst archive path",
                                                             Some(("Zstd Tar", &["zst"])),
