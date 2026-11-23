@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     HANDLE hLocalMap = create_cls_init_map("Init_MapFile_", &sa, &localView);
     HANDLE hGlobalMap = create_cls_init_map("Global\\Init_MapFile_", &sa, &globalView);
 
-    printf("[UNARC-HOST] v8.0 | Init_MapFile_=%s | Global\\Init_MapFile_=%s\n",
+    printf("[UNARC-HOST] v8.1 | Init_MapFile_=%s | Global\\Init_MapFile_=%s\n",
            (hLocalMap && localView) ? "OK" : "FAIL",
            (hGlobalMap && globalView) ? "OK" : "FAIL");
     fflush(stdout);
@@ -180,7 +180,12 @@ int main(int argc, char **argv) {
     if (hGlobalMap) CloseHandle(hGlobalMap);
 
     if (rc != 0) {
-        printf("ERROR: FreeArcExtract returned code %d\n", rc);
+        printf("ERROR: FreeArcExtract returned code %d (args:", rc);
+        for (i = 0; i < n; i++) {
+            if (a[i][0] == '-' && a[i][1] == 'p') printf(" -p***");
+            else printf(" [%s]", a[i]);
+        }
+        printf(")\n");
         fflush(stdout);
         return (rc < 0) ? (-rc) : rc;
     }

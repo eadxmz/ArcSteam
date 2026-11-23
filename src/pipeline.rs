@@ -1436,7 +1436,7 @@ fn run_unarc_extract(
     archive_path: &Path,
     target_game_dir: &Path,
     fast_temp_dir: &Path,
-    excluded_games: &[String],
+    _excluded_games: &[String],
     password: Option<&str>,
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: &Arc<PipelineControl>,
@@ -1462,10 +1462,6 @@ fn run_unarc_extract(
         ];
         if let Some(pwd) = password {
             args.push(format!("-p{pwd}"));
-        }
-        for ex in excluded_games {
-            args.push(format!("-x{ex}\\*"));
-            args.push(format!("-x{ex}"));
         }
         args.push("--".into());
         args.push(archive_path.display().to_string());
@@ -1497,10 +1493,6 @@ fn run_unarc_extract(
     ];
     if let Some(pwd) = password {
         args.push(format!("-p{pwd}"));
-    }
-    for ex in excluded_games {
-        args.push(format!("-x{ex}\\*"));
-        args.push(format!("-x{ex}"));
     }
     args.push(archive_path.display().to_string());
     run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, control, job_start, start_p, end_p)
