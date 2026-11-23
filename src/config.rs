@@ -14,7 +14,10 @@ pub struct AppConfig {
     pub defender_bypass: bool,
     pub replay_registry: bool,
     pub create_shortcuts: bool,
+    pub create_start_menu: bool,
+    pub start_menu_folder: String,
     pub auto_clean_temp: bool,
+    pub auto_ram: bool,
     pub srep_ram_mb: u64,
     pub post_queue_action: PostQueueAction,
 }
@@ -45,7 +48,10 @@ impl Default for AppConfig {
             defender_bypass: true,
             replay_registry: true,
             create_shortcuts: true,
+            create_start_menu: true,
+            start_menu_folder: String::new(),
             auto_clean_temp: true,
+            auto_ram: true,
             srep_ram_mb: optimizer::optimal_srep_ram_mb(),
             post_queue_action: PostQueueAction::DoNothing,
         }
@@ -95,7 +101,10 @@ impl AppConfig {
                 "defender_bypass" => cfg.defender_bypass = val == "true",
                 "replay_registry" => cfg.replay_registry = val == "true",
                 "create_shortcuts" => cfg.create_shortcuts = val == "true",
+                "create_start_menu" => cfg.create_start_menu = val == "true",
+                "start_menu_folder" => cfg.start_menu_folder = val.to_string(),
                 "auto_clean_temp" => cfg.auto_clean_temp = val == "true",
+                "auto_ram" => cfg.auto_ram = val == "true",
                 "srep_ram_mb" => {
                     if let Ok(n) = val.parse::<u64>() {
                         cfg.srep_ram_mb = n.clamp(1024, 16384);
@@ -113,7 +122,7 @@ impl AppConfig {
 
     pub fn save(&self) {
         let data = format!(
-            "local_source={}\ndownload_cache_dir={}\ntemp_ssd_dir={}\ntarget_game_dir={}\nvirtual_drive={}\nlive_install_while_dl={}\ndefender_bypass={}\nreplay_registry={}\ncreate_shortcuts={}\nauto_clean_temp={}\nsrep_ram_mb={}\npost_queue_action={}\n",
+            "local_source={}\ndownload_cache_dir={}\ntemp_ssd_dir={}\ntarget_game_dir={}\nvirtual_drive={}\nlive_install_while_dl={}\ndefender_bypass={}\nreplay_registry={}\ncreate_shortcuts={}\ncreate_start_menu={}\nstart_menu_folder={}\nauto_clean_temp={}\nauto_ram={}\nsrep_ram_mb={}\npost_queue_action={}\n",
             self.local_source.display(),
             self.download_cache_dir.display(),
             self.temp_ssd_dir.display(),
@@ -123,7 +132,10 @@ impl AppConfig {
             self.defender_bypass,
             self.replay_registry,
             self.create_shortcuts,
+            self.create_start_menu,
+            self.start_menu_folder,
             self.auto_clean_temp,
+            self.auto_ram,
             self.srep_ram_mb,
             self.post_queue_action.as_str(),
         );

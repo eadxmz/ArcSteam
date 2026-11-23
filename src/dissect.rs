@@ -59,7 +59,6 @@ fn common_docs_dir() -> PathBuf {
     PathBuf::from(r"C:\Users\Public\Documents")
 }
 
-/// Expands Inno Setup directory constants (`{app}`, `{userdocs}`, `{localappdata}`, etc.).
 pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> String {
     let app_str = target_app_dir.display().to_string();
     let tmp_str = work_dir.display().to_string();
@@ -93,8 +92,6 @@ pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> 
     out
 }
 
-/// Unpacks setup.exe's embedded files (`{tmp}`, `{app}`, `{userdocs}`, etc.)
-/// and parses `install_script.iss` for passwords, `[Dirs]`, `[Registry]`, `[Icons]`, and safe `[Run]` tasks.
 pub fn dissect_inno_setup(
     innounp_exe: &Path,
     setup_exe: &Path,
@@ -119,7 +116,6 @@ pub fn dissect_inno_setup(
         return Ok(result);
     }
 
-    // Flatten FreeArc/CLS plugins from `{tmp}` (or nested subdirs) into `work_dir`
     for entry in WalkDir::new(work_dir).max_depth(4).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -181,11 +177,31 @@ pub fn dissect_inno_setup(
     Ok(result)
 }
 
-fn copy_tree_filtered(src_root: &Path, dst_root: &Path) -> usize {
+fn is_path_excluded(rel: &Path, excluded_games: &[String]) -> bool {
+    if excluded_games.is_empty() {
+        return false;
+    }
+    let Some(first) = rel.components().next() else {
+        return false;
+    };
+    let top = first.as_os_str().to_string_lossy().to_ascii_lowercase();
+    excluded_games
+        .iter()
+        .any(|g| g.to_ascii_lowercase() == top)
+}
+
+fn copy_tree_filtered(
+    src_root: &Path,
+    dst_root: &Path,
+    excluded_games: &[String],
+) -> (usize, Vec<PathBuf>) {
     if !src_root.is_dir() {
-        return 0;
+        return (0, Vec::new());
     }
     let mut copied = 0usize;
+    let mut top_dirs = Vec::new();
+    let mut seen_top = HashSet::new();
+
     for entry in WalkDir::new(src_root).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -194,6 +210,9 @@ fn copy_tree_filtered(src_root: &Path, dst_root: &Path) -> usize {
         let Ok(rel) = src.strip_prefix(src_root) else {
             continue;
         };
+        if is_path_excluded(rel, excluded_games) {
+            continue;
+        }
         let lower_name = src
             .file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
@@ -211,15 +230,27 @@ fn copy_tree_filtered(src_root: &Path, dst_root: &Path) -> usize {
         }
         if fs::copy(src, &dst).is_ok() {
             copied += 1;
+            if let Some(first) = rel.components().next() {
+                let td = dst_root.join(first.as_os_str());
+                let key = td.display().to_string().to_ascii_lowercase();
+                if td.is_dir() && seen_top.insert(key) {
+                    top_dirs.push(td);
+                }
+            }
         }
     }
-    copied
+    (copied, top_dirs)
 }
 
-/// Copies embedded game/profile files extracted from `setup.exe` (`{app}`, `{userdocs}`,
-/// `{userappdata}`, `{localappdata}`, `{commonappdata}`) to their real Windows destinations.
-pub fn deploy_embedded_setup_files(work_dir: &Path, target_app_dir: &Path) -> usize {
+/// Deploys embedded setup.exe files (`{app}`, `{userdocs}`, `{userappdata}`, etc.).
+/// Returns `(copied_file_count, tracked_external_profile_dirs)`.
+pub fn deploy_embedded_setup_files(
+    work_dir: &Path,
+    target_app_dir: &Path,
+    excluded_games: &[String],
+) -> (usize, Vec<PathBuf>) {
     let mut total = 0usize;
+    let mut profile_dirs = Vec::new();
     let mappings: [(&str, PathBuf); 6] = [
         ("{app}", target_app_dir.to_path_buf()),
         ("{userdocs}", user_docs_dir()),
@@ -238,27 +269,43 @@ pub fn deploy_embedded_setup_files(work_dir: &Path, target_app_dir: &Path) -> us
             let dir_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
             for (token, dst) in &mappings {
                 if dir_name == *token && !dst.as_os_str().is_empty() {
-                    total += copy_tree_filtered(&path, dst);
+                    let ex: &[String] = if *token == "{app}" { excluded_games } else { &[] };
+                    let (n, dirs) = copy_tree_filtered(&path, dst, ex);
+                    total += n;
+                    if *token != "{app}" {
+                        profile_dirs.extend(dirs);
+                    }
                 }
             }
         }
     }
-    total
+    (total, profile_dirs)
 }
 
-/// Creates all directories declared in `install_script.iss` `[Dirs]` (e.g., `Documents\My Games\...`).
-pub fn create_script_dirs(dirs: &[String], target_app_dir: &Path, work_dir: &Path) -> usize {
+/// Creates directories declared in `[Dirs]` and returns `(count, external_profile_dirs)`.
+pub fn create_script_dirs(
+    dirs: &[String],
+    target_app_dir: &Path,
+    work_dir: &Path,
+) -> (usize, Vec<PathBuf>) {
     let mut created = 0usize;
+    let mut external_profiles = Vec::new();
+    let app_lower = target_app_dir.display().to_string().to_ascii_lowercase();
+
     for raw in dirs {
         let expanded = expand_inno_tokens(raw, target_app_dir, work_dir);
         let p = PathBuf::from(expanded.trim());
         if !p.as_os_str().is_empty() && !p.to_string_lossy().contains('{') {
             if fs::create_dir_all(&p).is_ok() {
                 created += 1;
+                let pl = p.display().to_string().to_ascii_lowercase();
+                if !pl.starts_with(&app_lower) {
+                    external_profiles.push(p);
+                }
             }
         }
     }
-    created
+    (created, external_profiles)
 }
 
 fn parse_install_script(script: &str, out: &mut DissectedSetup) {
@@ -413,14 +460,15 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
     }
 }
 
-/// Applies `[Registry]` keys with proper 32-bit `WOW6432Node` (`/reg:32`) + 64-bit (`/reg:64`) routing
-/// so 32-bit games (e.g. Far Cry 3, Blood Dragon, older Ubisoft/EA titles) always see their keys.
+/// Applies `[Registry]` keys (both 32-bit WOW6432Node and 64-bit) and returns `(count, unique_written_keys)`.
 pub fn apply_registry_entries(
     entries: &[RegistryEntry],
     target_app_dir: &Path,
     work_dir: &Path,
-) -> usize {
+) -> (usize, Vec<String>) {
     let mut applied = 0usize;
+    let mut keys_written = Vec::new();
+    let mut seen_keys = HashSet::new();
 
     for e in entries {
         let upper_root = e.root.to_ascii_uppercase();
@@ -466,30 +514,85 @@ pub fn apply_registry_entries(
         }
         if wrote_any {
             applied += 1;
+            if seen_keys.insert(key_path.to_ascii_lowercase()) {
+                keys_written.push(key_path);
+            }
         }
     }
-    applied
+    (applied, keys_written)
 }
 
-/// Creates Desktop `.lnk` shortcuts for parsed Inno `[Icons]` game executables.
-pub fn create_desktop_shortcuts(icons: &[IconEntry], target_app_dir: &Path) -> usize {
+fn create_lnk_shortcut(
+    lnk_path: &Path,
+    target: &Path,
+    args: Option<&str>,
+    work_dir: &str,
+) -> bool {
+    if let Some(parent) = lnk_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let esc_lnk = lnk_path.display().to_string().replace('\'', "''");
+    let esc_target = target.display().to_string().replace('\'', "''");
+    let esc_work = work_dir.replace('\'', "''");
+    let args_line = match args {
+        Some(a) => format!("$lnk.Arguments = '{}'; ", a.replace('\'', "''")),
+        None => String::new(),
+    };
+    let ps = format!(
+        "$ws = New-Object -ComObject WScript.Shell; \
+         $lnk = $ws.CreateShortcut('{esc_lnk}'); \
+         $lnk.TargetPath = '{esc_target}'; \
+         {args_line}\
+         $lnk.WorkingDirectory = '{esc_work}'; \
+         $lnk.Save()"
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn sanitize_shortcut_name(raw: &str) -> String {
+    raw.rsplit('\\')
+        .next()
+        .unwrap_or("Game")
+        .replace([':', '*', '?', '"', '<', '>', '|', '/'], "")
+        .trim()
+        .to_string()
+}
+
+fn icon_is_excluded(icon: &IconEntry, excluded_games: &[String]) -> bool {
+    let lower_raw = icon.filename.to_ascii_lowercase();
+    excluded_games.iter().any(|g| {
+        let gl = g.to_ascii_lowercase();
+        lower_raw.contains(&format!("\\{gl}\\")) || lower_raw.contains(&format!("/{gl}/"))
+    })
+}
+
+/// Creates Desktop `.lnk` shortcuts and returns the exact `.lnk` paths created.
+pub fn create_desktop_shortcuts(
+    icons: &[IconEntry],
+    target_app_dir: &Path,
+    excluded_games: &[String],
+) -> Vec<PathBuf> {
+    let desktop = std::env::var_os("USERPROFILE")
+        .map(|p| PathBuf::from(p).join("Desktop"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public\Desktop"));
     let app_str = target_app_dir.display().to_string();
-    let mut created = 0usize;
+    let mut created = Vec::new();
     let mut seen_targets = HashSet::new();
 
     for icon in icons {
+        if icon_is_excluded(icon, excluded_games) {
+            continue;
+        }
         let exe_path = PathBuf::from(icon.filename.replace("{app}", &app_str));
         if !exe_path.exists() || !seen_targets.insert(exe_path.clone()) {
             continue;
         }
-        let clean_name = icon
-            .name
-            .rsplit('\\')
-            .next()
-            .unwrap_or("Game")
-            .replace([':', '*', '?', '"', '<', '>', '|'], "")
-            .trim()
-            .to_string();
+        let clean_name = sanitize_shortcut_name(&icon.name);
         if clean_name.is_empty() {
             continue;
         }
@@ -501,27 +604,225 @@ pub fn create_desktop_shortcuts(icons: &[IconEntry], target_app_dir: &Path) -> u
         } else {
             icon.working_dir.replace("{app}", &app_str)
         };
-
-        let esc_name = clean_name.replace('\'', "''");
-        let esc_target = exe_path.display().to_string().replace('\'', "''");
-        let esc_work = work_dir.replace('\'', "''");
-
-        let ps = format!(
-            "$ws = New-Object -ComObject WScript.Shell; \
-             $lnk = $ws.CreateShortcut([Environment]::GetFolderPath('Desktop') + '\\{esc_name}.lnk'); \
-             $lnk.TargetPath = '{esc_target}'; \
-             $lnk.WorkingDirectory = '{esc_work}'; \
-             $lnk.Save()"
-        );
-        if Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            created += 1;
+        let lnk = desktop.join(format!("{clean_name}.lnk"));
+        if create_lnk_shortcut(&lnk, &exe_path, None, &work_dir) {
+            created.push(lnk);
         }
     }
     created
+}
+
+/// Creates a Start Menu folder with game `.lnk` shortcuts + an `Uninstall` shortcut pointing to ArcSteam.
+/// Returns `(Option<start_menu_folder_path>, Vec<created_lnk_paths>)`.
+pub fn create_start_menu_shortcuts(
+    icons: &[IconEntry],
+    target_app_dir: &Path,
+    excluded_games: &[String],
+    folder_name: &str,
+    uninstall_id: &str,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let clean_folder = sanitize_shortcut_name(folder_name);
+    if clean_folder.is_empty() {
+        return (None, Vec::new());
+    }
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return (None, Vec::new());
+    };
+    let sm_dir = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join(&clean_folder);
+    if fs::create_dir_all(&sm_dir).is_err() {
+        return (None, Vec::new());
+    }
+
+    let app_str = target_app_dir.display().to_string();
+    let mut created = Vec::new();
+    let mut seen_targets = HashSet::new();
+
+    for icon in icons {
+        if icon_is_excluded(icon, excluded_games) {
+            continue;
+        }
+        let exe_path = PathBuf::from(icon.filename.replace("{app}", &app_str));
+        if !exe_path.exists() || !seen_targets.insert(exe_path.clone()) {
+            continue;
+        }
+        let clean_name = sanitize_shortcut_name(&icon.name);
+        if clean_name.is_empty() {
+            continue;
+        }
+        let work_dir = if icon.working_dir.is_empty() {
+            exe_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| app_str.clone())
+        } else {
+            icon.working_dir.replace("{app}", &app_str)
+        };
+        let lnk = sm_dir.join(format!("{clean_name}.lnk"));
+        if create_lnk_shortcut(&lnk, &exe_path, None, &work_dir) {
+            created.push(lnk);
+        }
+    }
+
+    // Add an Uninstall shortcut inside the Start Menu folder pointing directly to ArcSteam
+    if let Ok(arcsteam_exe) = std::env::current_exe() {
+        let uninst_lnk = sm_dir.join(format!("Uninstall {clean_folder}.lnk"));
+        let args = format!("--uninstall {uninstall_id}");
+        let wd = arcsteam_exe
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if create_lnk_shortcut(&uninst_lnk, &arcsteam_exe, Some(&args), &wd) {
+            created.push(uninst_lnk);
+        }
+    }
+
+    (Some(sm_dir), created)
+}
+
+/// Quickly extracts `install_script.iss` from a repack's `setup.exe` and detects whether
+/// the repack bundles 2 or more distinct games (top-level game folders under `{app}\...`).
+pub fn discover_bundled_games(innounp_exe: &Path, setup_exe: &Path) -> Vec<String> {
+    if !innounp_exe.exists() || !setup_exe.exists() {
+        return Vec::new();
+    }
+    let probe_dir = std::env::temp_dir().join("arcsteam_probe_iss");
+    let _ = fs::remove_dir_all(&probe_dir);
+    let _ = fs::create_dir_all(&probe_dir);
+
+    let _ = Command::new(innounp_exe)
+        .args([
+            "-x",
+            "-y",
+            &format!("-d{}", probe_dir.display()),
+            &setup_exe.display().to_string(),
+            "install_script.iss",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    let iss_path = probe_dir.join("install_script.iss");
+    let mut games = Vec::new();
+    if let Ok(bytes) = fs::read(&iss_path) {
+        let script = if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+            let u16s: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&u16s)
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+
+        let mut parsed = DissectedSetup::default();
+        parse_install_script(&script, &mut parsed);
+
+        let generic_dirs = [
+            "bin", "bin32", "bin64", "binaries", "data", "data_win32", "engine", "game",
+            "support", "redist", "_redist", "commonredist", "work", "docs", "manual",
+            "patch", "update", "crack", "nodvd", "tools", "system", "x64", "x86", "win64",
+            "win32", "launch", "launcher",
+        ];
+
+        let mut seen = HashSet::new();
+        for icon in &parsed.icon_entries {
+            let trimmed = icon.filename.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("{app}\\") || lower.starts_with("{app}/") {
+                let orig_rest = &trimmed[6..];
+                if let Some((first_seg, tail)) = orig_rest
+                    .split_once('\\')
+                    .or_else(|| orig_rest.split_once('/'))
+                {
+                    let seg = first_seg.trim();
+                    let seg_l = seg.to_ascii_lowercase();
+                    if !seg.is_empty()
+                        && !tail.is_empty()
+                        && !generic_dirs.contains(&seg_l.as_str())
+                        && seen.insert(seg_l)
+                    {
+                        games.push(seg.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&probe_dir);
+    if games.len() >= 2 { games } else { Vec::new() }
+}
+
+/// Discovers post-unpack reconstruction batch scripts extracted by FitGirl/DODI/R.G. Mechanics
+/// (e.g., `work\work\build01.bat`, `unpack*.bat`, `rebuild*.bat`, `fgpack*.bat`).
+pub fn discover_post_unpack_scripts(target_app_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in WalkDir::new(target_app_dir).max_depth(3).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name_os) = path.file_name() else {
+            continue;
+        };
+        let lower = name_os.to_string_lossy().to_ascii_lowercase();
+        if !lower.ends_with(".bat") && !lower.ends_with(".cmd") {
+            continue;
+        }
+        if lower.contains("unins")
+            || lower.contains("check")
+            || lower.contains("verify")
+            || lower.contains("clean")
+            || lower.contains("md5")
+            || lower.contains("sfv")
+            || lower.contains("language")
+            || lower.contains("lang")
+        {
+            continue;
+        }
+        let in_work_dir = path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("\\work\\");
+        let is_builder_name = lower.starts_with("build")
+            || lower.starts_with("unpack")
+            || lower.starts_with("rebuild")
+            || lower.starts_with("repack")
+            || lower.starts_with("decode")
+            || lower.starts_with("decompress")
+            || lower.starts_with("convert")
+            || lower.starts_with("fgpack")
+            || lower.starts_with("xdelta")
+            || lower.starts_with("patch");
+
+        if is_builder_name && (in_work_dir || lower.starts_with("build") || lower.starts_with("unpack")) {
+            found.push(path.to_path_buf());
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Determines the right working directory (`bat_dir` vs `target_app_dir`) and whether `%1` is expected.
+pub fn detect_script_cwd_and_args(bat_path: &Path, target_app_dir: &Path) -> (PathBuf, bool) {
+    let bat_dir = bat_path.parent().unwrap_or(target_app_dir).to_path_buf();
+    let content = fs::read(bat_path)
+        .map(|b| String::from_utf8_lossy(&b).to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let needs_app_arg = content.contains("%1") || content.contains("%~1");
+    let uses_parent_rel = content.contains("..\\") || content.contains("../");
+    let uses_work_prefix = content.contains("work\\") || content.contains("work/");
+
+    let cwd = if uses_parent_rel {
+        bat_dir
+    } else if uses_work_prefix {
+        target_app_dir.to_path_buf()
+    } else {
+        bat_dir
+    };
+
+    (cwd, needs_app_arg)
 }

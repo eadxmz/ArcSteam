@@ -4,6 +4,7 @@ mod config;
 mod detect;
 mod dissect;
 mod embedded_tools;
+mod manifest;
 mod optimizer;
 mod pipeline;
 mod stream_bridge;
@@ -18,11 +19,13 @@ use eframe::egui::{
     Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, TextStyle, TextureHandle, TextureOptions,
     Vec2,
 };
+use manifest::{InstallManifest, UninstallMode};
+use optimizer::DynamicRamPlan;
 use pipeline::{JobConfig, PipelineControl, QueueEntry, QueueItemState, SharedTelemetry};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use verify::{FileVerifyOutcome, VerifyProgress};
 use win_sys::PostQueueAction;
 use zstd_pack::ZstdProgress;
@@ -30,7 +33,7 @@ use zstd_pack::ZstdProgress;
 const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/icon_rgba.bin");
 const BG_AURA_RGBA: &[u8] = include_bytes!("../assets/bg_aura.bin");
 
-// Studio Dark + Subtle Amethyst Glass Palette (restrained, high-contrast, clean)
+// Studio Dark + Subtle Amethyst Glass Palette
 const GLASS_CARD_BG: Color32 = Color32::from_rgba_premultiplied(14, 14, 20, 226);
 const GLASS_BAR_BG: Color32 = Color32::from_rgba_premultiplied(12, 12, 18, 232);
 const SURFACE_INPUT: Color32 = Color32::from_rgb(18, 18, 26);
@@ -38,10 +41,10 @@ const SURFACE_HOVER: Color32 = Color32::from_rgb(28, 27, 40);
 const BORDER_GLASS: Color32 = Color32::from_rgba_premultiplied(54, 52, 66, 66);
 const BORDER_SUBTLE: Color32 = Color32::from_rgb(38, 37, 52);
 
-const ACCENT_MAIN: Color32 = Color32::from_rgb(139, 92, 246);    // Refined Violet
-const ACCENT_SOFT: Color32 = Color32::from_rgb(180, 152, 250);   // Soft Lavender highlight
-const CTA_GRAD_L: Color32 = Color32::from_rgb(124, 58, 237);     // Deep Amethyst
-const CTA_GRAD_R: Color32 = Color32::from_rgb(167, 139, 250);    // Soft Periwinkle-Violet
+const ACCENT_MAIN: Color32 = Color32::from_rgb(139, 92, 246);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(180, 152, 250);
+const CTA_GRAD_L: Color32 = Color32::from_rgb(124, 58, 237);
+const CTA_GRAD_R: Color32 = Color32::from_rgb(167, 139, 250);
 
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(244, 244, 248);
 const TEXT_SECONDARY: Color32 = Color32::from_rgb(154, 154, 174);
@@ -54,6 +57,7 @@ const ERR_CORAL: Color32 = Color32::from_rgb(248, 113, 113);
 enum MainTab {
     Install,
     Queue,
+    Installed,
     Tools,
 }
 
@@ -94,6 +98,7 @@ struct ArcSteamApp {
     magnet_or_torrent: String,
     detected_format: RepackFormat,
     scanned_files: Vec<RepackFileEntry>,
+    bundled_games: Vec<(String, bool)>,
     queue: Vec<QueueEntry>,
     telemetry: Arc<Mutex<SharedTelemetry>>,
     control: Arc<PipelineControl>,
@@ -102,6 +107,13 @@ struct ArcSteamApp {
     show_settings: bool,
     show_logs: bool,
     bg_texture: Option<TextureHandle>,
+    // Live Dynamic RAM monitor
+    ram_plan: DynamicRamPlan,
+    last_ram_poll: Instant,
+    // Installed Library & Uninstaller state
+    installed_manifests: Vec<InstallManifest>,
+    uninstall_target_id: Option<String>,
+    uninstall_running: Arc<AtomicBool>,
     // Tools tab
     verify_dir: PathBuf,
     verify_progress: Arc<Mutex<VerifyProgress>>,
@@ -113,17 +125,19 @@ struct ArcSteamApp {
     zstd_cancel: Arc<AtomicBool>,
 }
 
-impl Default for ArcSteamApp {
-    fn default() -> Self {
+impl ArcSteamApp {
+    fn new(initial_uninstall_id: Option<String>) -> Self {
         let extracted = embedded_tools::ensure_extracted();
         let bundled = embedded_tools::embedded_count();
         let cfg = AppConfig::load();
+        let ram_plan = optimizer::compute_dynamic_srep_ram();
 
         let mut initial_telemetry = SharedTelemetry::default();
         initial_telemetry.stage_label = "Ready".into();
         initial_telemetry.eta_text = "--".into();
         initial_telemetry.log(format!(
-            "[INIT] ArcSteam ready — {extracted}/{bundled} built-in components verified."
+            "[INIT] ArcSteam ready — {extracted}/{bundled} built-in components verified | Live RAM: {} MB free -> Auto SREP {} MB.",
+            ram_plan.available_mb, ram_plan.recommended_mb
         ));
 
         let telemetry = Arc::new(Mutex::new(initial_telemetry));
@@ -143,14 +157,21 @@ impl Default for ArcSteamApp {
         let verify_dir = cfg.local_source.clone();
         let zstd_src = cfg.target_game_dir.clone();
         let zstd_dst = cfg.download_cache_dir.join("GameBackup.tar.zst");
+        let installed_manifests = manifest::load_all_manifests();
+        let start_tab = if initial_uninstall_id.is_some() {
+            MainTab::Installed
+        } else {
+            MainTab::Install
+        };
 
-        Self {
-            tab: MainTab::Install,
+        let mut app = Self {
+            tab: start_tab,
             source_kind: SourceKind::LocalFolder,
             cfg,
             magnet_or_torrent: String::new(),
             detected_format: RepackFormat::FitGirlMultiArc,
             scanned_files: Vec::new(),
+            bundled_games: Vec::new(),
             queue: Vec::new(),
             telemetry,
             control: Arc::new(PipelineControl::default()),
@@ -159,6 +180,11 @@ impl Default for ArcSteamApp {
             show_settings: false,
             show_logs: false,
             bg_texture: None,
+            ram_plan,
+            last_ram_poll: Instant::now(),
+            installed_manifests,
+            uninstall_target_id: initial_uninstall_id,
+            uninstall_running: Arc::new(AtomicBool::new(false)),
             verify_dir,
             verify_progress: Arc::new(Mutex::new(VerifyProgress::default())),
             verify_cancel: Arc::new(AtomicBool::new(false)),
@@ -167,11 +193,14 @@ impl Default for ArcSteamApp {
             zstd_level: 4,
             zstd_progress: Arc::new(Mutex::new(ZstdProgress::default())),
             zstd_cancel: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
+        };
 
-impl ArcSteamApp {
+        if app.cfg.local_source.is_dir() {
+            app.scan_local_now();
+        }
+        app
+    }
+
     fn semibold(text: impl Into<String>, size: f32, color: Color32) -> RichText {
         RichText::new(text)
             .family(FontFamily::Name("semibold".into()))
@@ -182,7 +211,6 @@ impl ArcSteamApp {
     fn install_native_fonts(ctx: &egui::Context) {
         let mut fonts = FontDefinitions::default();
 
-        // Primary UI font: native Windows Segoe UI (crisp static TTF, zero .exe bloat)
         if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
             fonts
                 .font_data
@@ -194,7 +222,6 @@ impl ArcSteamApp {
                 .insert(0, "segoe_ui".to_owned());
         }
 
-        // Semibold display/heading font: Segoe UI Semibold
         let mut semi_chain = Vec::new();
         if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguisb.ttf") {
             fonts.font_data.insert(
@@ -217,7 +244,6 @@ impl ArcSteamApp {
             .families
             .insert(FontFamily::Name("semibold".into()), semi_chain);
 
-        // Clean monospace font for logs: Cascadia Mono -> Consolas
         if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\CascadiaMono.ttf")
             .or_else(|_| std::fs::read(r"C:\Windows\Fonts\consola.ttf"))
         {
@@ -367,7 +393,6 @@ impl ArcSteamApp {
         response
     }
 
-    /// Sleek 10px modern linear progress bar (no blobby 0% cap distortion) + clean header line.
     fn draw_sleek_progress(
         ui: &mut egui::Ui,
         dl_pct: f32,
@@ -423,9 +448,28 @@ impl ArcSteamApp {
     fn scan_local_now(&mut self) {
         if self.cfg.local_source.is_dir() {
             let (fmt, entries) = detect::scan_local_directory(&self.cfg.local_source);
+            let setup_exe = entries
+                .iter()
+                .find(|e| e.is_setup_exe)
+                .map(|e| self.cfg.local_source.join(&e.rel_path));
+            self.bundled_games = if let Some(setup) = setup_exe {
+                let innounp = embedded_tools::resolve_tool("innounp.exe");
+                dissect::discover_bundled_games(&innounp, &setup)
+                    .into_iter()
+                    .map(|name| (name, true))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.detected_format = fmt;
             self.scanned_files = entries;
             self.verify_dir = self.cfg.local_source.clone();
+
+            // Auto-fill Start Menu folder with repack folder name
+            if let Some(folder_name) = self.cfg.local_source.file_name().and_then(|n| n.to_str()) {
+                self.cfg.start_menu_folder = folder_name.to_string();
+            }
+
             if let Ok(mut t) = self.telemetry.lock() {
                 t.log(format!(
                     "[SCAN] {} -> {} ({} files)",
@@ -461,6 +505,26 @@ impl ArcSteamApp {
         });
     }
 
+    fn trigger_uninstall(&mut self, m: InstallManifest, mode: UninstallMode) {
+        if self.uninstall_running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.uninstall_target_id = None;
+        self.show_logs = true;
+        let flag = self.uninstall_running.clone();
+        let telemetry = self.telemetry.clone();
+        std::thread::spawn(move || {
+            let logs = manifest::execute_uninstall(&m, mode);
+            if let Ok(mut t) = telemetry.lock() {
+                for l in logs {
+                    t.log(l);
+                }
+                t.manifests_dirty = true;
+            }
+            flag.store(false, Ordering::Relaxed);
+        });
+    }
+
     fn build_current_job(&self, torrent_mode: bool) -> JobConfig {
         let display_name = if torrent_mode {
             let s = self.magnet_or_torrent.trim();
@@ -480,6 +544,12 @@ impl ArcSteamApp {
                 .unwrap_or_else(|| self.cfg.local_source.display().to_string())
         };
 
+        let effective_ram = if self.cfg.auto_ram {
+            optimizer::optimal_srep_ram_mb()
+        } else {
+            self.cfg.srep_ram_mb
+        };
+
         JobConfig {
             display_name,
             is_torrent_mode: torrent_mode,
@@ -493,12 +563,24 @@ impl ArcSteamApp {
             defender_bypass: self.cfg.defender_bypass,
             replay_registry: self.cfg.replay_registry,
             create_shortcuts: self.cfg.create_shortcuts,
+            create_start_menu: self.cfg.create_start_menu,
+            start_menu_folder: self.cfg.start_menu_folder.clone(),
             auto_clean_temp: self.cfg.auto_clean_temp,
-            srep_ram_mb: self.cfg.srep_ram_mb,
+            auto_ram: self.cfg.auto_ram,
+            srep_ram_mb: effective_ram,
             selected_files: if torrent_mode {
                 Vec::new()
             } else {
                 self.scanned_files.clone()
+            },
+            excluded_games: if torrent_mode {
+                Vec::new()
+            } else {
+                self.bundled_games
+                    .iter()
+                    .filter(|(_, checked)| !*checked)
+                    .map(|(name, _)| name.clone())
+                    .collect()
             },
             detected_format: self.detected_format,
         }
@@ -567,6 +649,12 @@ impl ArcSteamApp {
 
 impl eframe::App for ArcSteamApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Refresh dynamic RAM estimate every 2.5 seconds
+        if self.last_ram_poll.elapsed() >= Duration::from_millis(2500) {
+            self.ram_plan = optimizer::compute_dynamic_srep_ram();
+            self.last_ram_poll = Instant::now();
+        }
+
         // Drag-and-drop folders or .torrent files directly onto the window
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw
@@ -586,8 +674,10 @@ impl eframe::App for ArcSteamApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.display().to_string());
                     job.local_source_dir = path;
+                    job.start_menu_folder = job.display_name.clone();
                     job.detected_format = fmt;
                     job.selected_files = entries;
+                    job.excluded_games.clear();
                     self.queue.push(QueueEntry {
                         config: job,
                         state: QueueItemState::Queued,
@@ -632,9 +722,12 @@ impl eframe::App for ArcSteamApp {
             stage_label,
             active_q_idx,
             queue_states,
+            manifests_dirty,
             logs_snapshot,
         ) = {
-            let t = self.telemetry.lock().unwrap();
+            let mut t = self.telemetry.lock().unwrap();
+            let dirty = t.manifests_dirty;
+            t.manifests_dirty = false;
             (
                 t.running,
                 t.download_pct,
@@ -647,10 +740,14 @@ impl eframe::App for ArcSteamApp {
                 t.stage_label.clone(),
                 t.active_queue_idx,
                 t.queue_states.clone(),
+                dirty,
                 t.logs.clone(),
             )
         };
 
+        if manifests_dirty {
+            self.installed_manifests = manifest::load_all_manifests();
+        }
         if stage_label == "Failed" {
             self.show_logs = true;
         }
@@ -661,13 +758,14 @@ impl eframe::App for ArcSteamApp {
         }
 
         let wf_installing = self.winfsp_installing.load(Ordering::Relaxed);
+        let uninst_busy = self.uninstall_running.load(Ordering::Relaxed);
         if !wf_installing && !self.health.winfsp_ok && win_sys::is_winfsp_installed() {
             self.health = ToolsHealth::probe();
         }
 
         let verify_running = self.verify_progress.lock().unwrap().running;
         let zstd_running = self.zstd_progress.lock().unwrap().running;
-        if running || verify_running || zstd_running || wf_installing {
+        if running || verify_running || zstd_running || wf_installing || uninst_busy {
             ui.ctx().request_repaint_after(Duration::from_millis(140));
         }
 
@@ -684,7 +782,7 @@ impl eframe::App for ArcSteamApp {
         );
 
         // ===================================================================
-        // 1. PINNED TOP GLASS NAVBAR (always visible, never scrolls off)
+        // 1. PINNED TOP GLASS NAVBAR
         // ===================================================================
         egui::Panel::top("arcsteam_top_nav")
             .frame(Frame::NONE.inner_margin(Margin {
@@ -702,7 +800,7 @@ impl eframe::App for ArcSteamApp {
                         .corner_radius(CornerRadius::same(24))
                         .inner_margin(Margin::symmetric(16, 8))
                         .show(ui, |ui| {
-                            ui.set_max_width(580.0);
+                            ui.set_max_width(660.0);
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Image::new(egui::include_image!("../assets/logo.svg"))
@@ -710,16 +808,26 @@ impl eframe::App for ArcSteamApp {
                                 );
                                 ui.add_space(4.0);
                                 ui.label(Self::semibold("ArcSteam", 15.0, TEXT_PRIMARY));
-                                ui.add_space(20.0);
+                                ui.add_space(16.0);
 
-                                ui.selectable_value(&mut self.tab, MainTab::Install, "  Install  ");
+                                ui.selectable_value(&mut self.tab, MainTab::Install, " Install ");
                                 let q_lbl = if self.queue.is_empty() {
-                                    "  Queue  ".to_string()
+                                    " Queue ".to_string()
                                 } else {
-                                    format!("  Queue ({})  ", self.queue.len())
+                                    format!(" Queue ({}) ", self.queue.len())
                                 };
                                 ui.selectable_value(&mut self.tab, MainTab::Queue, q_lbl);
-                                ui.selectable_value(&mut self.tab, MainTab::Tools, "  Tools  ");
+
+                                let inst_lbl = if self.installed_manifests.is_empty() {
+                                    " Installed ".to_string()
+                                } else {
+                                    format!(" Installed ({}) ", self.installed_manifests.len())
+                                };
+                                if ui.selectable_value(&mut self.tab, MainTab::Installed, inst_lbl).clicked() {
+                                    self.installed_manifests = manifest::load_all_manifests();
+                                }
+
+                                ui.selectable_value(&mut self.tab, MainTab::Tools, " Tools ");
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let log_lbl = if self.show_logs { "Hide Logs" } else { "Logs" };
@@ -733,7 +841,7 @@ impl eframe::App for ArcSteamApp {
             });
 
         // ===================================================================
-        // 2. PINNED BOTTOM STATUS CAPSULE (always visible, never clipped)
+        // 2. PINNED BOTTOM STATUS CAPSULE
         // ===================================================================
         egui::Panel::bottom("arcsteam_bottom_bar")
             .frame(Frame::NONE.inner_margin(Margin {
@@ -787,6 +895,15 @@ impl eframe::App for ArcSteamApp {
 
                                 ui.label(RichText::new("•").color(TEXT_DIM));
 
+                                let ram_badge = if self.cfg.auto_ram {
+                                    format!("Auto RAM: {} MB", self.ram_plan.recommended_mb)
+                                } else {
+                                    format!("RAM: {} MB", self.cfg.srep_ram_mb)
+                                };
+                                ui.label(RichText::new(ram_badge).size(11.5).color(TEXT_SECONDARY));
+
+                                ui.label(RichText::new("•").color(TEXT_DIM));
+
                                 if self.health.is_admin {
                                     ui.label(RichText::new("● Elevated").size(11.5).color(OK_MINT));
                                 } else if ui.small_button("Run as Admin").clicked() {
@@ -800,12 +917,12 @@ impl eframe::App for ArcSteamApp {
             });
 
         // ===================================================================
-        // 3. CENTERED FROSTED-GLASS HERO CARD (strictly left-aligned inside!)
+        // 3. CENTERED FROSTED-GLASS HERO CARD
         // ===================================================================
         egui::CentralPanel::default()
             .frame(Frame::NONE.inner_margin(Margin::symmetric(24, 6)))
             .show(ui, |ui| {
-                let card_w = (ui.available_width() - 16.0).clamp(500.0, 680.0);
+                let card_w = (ui.available_width() - 16.0).clamp(520.0, 700.0);
                 let avail_h = ui.available_height();
 
                 ui.vertical_centered(|ui| {
@@ -816,20 +933,18 @@ impl eframe::App for ArcSteamApp {
                         .inner_margin(Margin {
                             left: 28,
                             right: 16,
-                            top: 22,
-                            bottom: 20,
+                            top: 20,
+                            bottom: 18,
                         })
                         .show(ui, |ui| {
                             ui.set_width(card_w);
                             ui.set_max_height((avail_h - 8.0).max(240.0));
 
-                            // Reset layout to top-down LEFT so nothing inside gets awkwardly centered
                             ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
                                 egui::ScrollArea::vertical()
                                     .id_salt("hero_card_scroll")
                                     .auto_shrink([false, true])
                                     .show(ui, |ui| {
-                                        // Right padding inside scroll area prevents scrollbar overlap!
                                         Frame::NONE
                                             .inner_margin(Margin {
                                                 left: 0,
@@ -840,7 +955,6 @@ impl eframe::App for ArcSteamApp {
                                             .show(ui, |ui| {
                                                 match self.tab {
                                                     MainTab::Install => {
-                                                        // Centered Hero Header
                                                         ui.vertical_centered(|ui| {
                                                             ui.label(
                                                                 RichText::new("Universal Zero-Wait Repack Engine")
@@ -848,10 +962,9 @@ impl eframe::App for ArcSteamApp {
                                                                     .color(TEXT_SECONDARY),
                                                             );
                                                             ui.add_space(2.0);
-                                                            ui.label(Self::semibold("ArcSteam Installer", 26.0, TEXT_PRIMARY));
-                                                            ui.add_space(10.0);
+                                                            ui.label(Self::semibold("ArcSteam Installer", 25.0, TEXT_PRIMARY));
+                                                            ui.add_space(8.0);
 
-                                                            // Source Mode Segmented Switch
                                                             Frame::new()
                                                                 .fill(SURFACE_INPUT)
                                                                 .stroke(Stroke::new(1.0, BORDER_SUBTLE))
@@ -873,7 +986,7 @@ impl eframe::App for ArcSteamApp {
                                                                 });
                                                         });
 
-                                                        ui.add_space(16.0);
+                                                        ui.add_space(14.0);
 
                                                         // Step 1: Source
                                                         if self.source_kind == SourceKind::LocalFolder {
@@ -918,6 +1031,17 @@ impl eframe::App for ArcSteamApp {
                                                                         .color(TEXT_SECONDARY),
                                                                     );
                                                                 });
+
+                                                                // Generalized Multi-Game Selector (only appears for 2+ game repacks)
+                                                                if self.bundled_games.len() >= 2 {
+                                                                    ui.add_space(6.0);
+                                                                    ui.horizontal_wrapped(|ui| {
+                                                                        ui.label(Self::semibold("Games to Install:", 12.0, TEXT_PRIMARY));
+                                                                        for (game_name, checked) in &mut self.bundled_games {
+                                                                            ui.checkbox(checked, game_name.as_str());
+                                                                        }
+                                                                    });
+                                                                }
 
                                                                 egui::CollapsingHeader::new(
                                                                     RichText::new("Customize languages & optional files")
@@ -988,7 +1112,7 @@ impl eframe::App for ArcSteamApp {
                                                             }
                                                         }
 
-                                                        ui.add_space(12.0);
+                                                        ui.add_space(10.0);
 
                                                         // Step 2: Destination
                                                         if Self::input_row(
@@ -1002,7 +1126,33 @@ impl eframe::App for ArcSteamApp {
                                                             cfg_dirty = true;
                                                         }
 
-                                                        ui.add_space(18.0);
+                                                        ui.add_space(10.0);
+
+                                                        // Step 3: Visible Desktop Icon & Start Menu Folder controls
+                                                        ui.horizontal(|ui| {
+                                                            if ui.checkbox(&mut self.cfg.create_shortcuts, "Desktop Icon").changed() {
+                                                                cfg_dirty = true;
+                                                            }
+                                                            ui.add_space(8.0);
+                                                            if ui.checkbox(&mut self.cfg.create_start_menu, "Start Menu Folder:").changed() {
+                                                                cfg_dirty = true;
+                                                            }
+                                                            let sm_w = (ui.available_width() - 4.0).max(140.0);
+                                                            if ui
+                                                                .add_enabled(
+                                                                    self.cfg.create_start_menu,
+                                                                    egui::TextEdit::singleline(&mut self.cfg.start_menu_folder)
+                                                                        .hint_text("Auto (Game Name)")
+                                                                        .margin(Margin::symmetric(10, 6))
+                                                                        .desired_width(sm_w),
+                                                                )
+                                                                .changed()
+                                                            {
+                                                                cfg_dirty = true;
+                                                            }
+                                                        });
+
+                                                        ui.add_space(14.0);
 
                                                         // Primary Action or Live Sleek Progress
                                                         let is_torrent_active = self.source_kind == SourceKind::TorrentMagnet;
@@ -1017,7 +1167,6 @@ impl eframe::App for ArcSteamApp {
                                                             );
                                                             ui.add_space(8.0);
 
-                                                            // Dedicated clean telemetry row (never collides with buttons!)
                                                             let worker_txt = if active_worker.is_empty() {
                                                                 "Initializing"
                                                             } else {
@@ -1063,10 +1212,12 @@ impl eframe::App for ArcSteamApp {
                                                                 });
                                                             });
                                                         } else {
+                                                            let has_selected_game = self.bundled_games.is_empty()
+                                                                || self.bundled_games.iter().any(|(_, c)| *c);
                                                             let has_input = if is_torrent_active {
                                                                 !self.magnet_or_torrent.trim().is_empty()
                                                             } else {
-                                                                !self.cfg.local_source.as_os_str().is_empty()
+                                                                !self.cfg.local_source.as_os_str().is_empty() && has_selected_game
                                                             };
                                                             let cta_text = if is_torrent_active {
                                                                 "Stream & Install Now   >"
@@ -1115,7 +1266,7 @@ impl eframe::App for ArcSteamApp {
                                                             });
                                                         }
 
-                                                        // Collapsible Turbo Settings Drawer
+                                                        // Collapsible Turbo Settings Drawer (with Dynamic Auto-RAM)
                                                         if self.show_settings {
                                                             ui.add_space(12.0);
                                                             ui.separator();
@@ -1147,17 +1298,29 @@ impl eframe::App for ArcSteamApp {
                                                             ui.horizontal_wrapped(|ui| {
                                                                 if ui.checkbox(&mut self.cfg.defender_bypass, "Defender Boost").changed() { cfg_dirty = true; }
                                                                 if ui.checkbox(&mut self.cfg.replay_registry, "Auto Registry").changed() { cfg_dirty = true; }
-                                                                if ui.checkbox(&mut self.cfg.create_shortcuts, "Desktop Shortcuts").changed() { cfg_dirty = true; }
                                                                 if ui.checkbox(&mut self.cfg.auto_clean_temp, "Clean Temp").changed() { cfg_dirty = true; }
                                                             });
                                                             ui.add_space(6.0);
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(RichText::new("SREP Memory:").size(12.0).color(TEXT_SECONDARY));
-                                                                if ui.add(egui::Slider::new(&mut self.cfg.srep_ram_mb, 1024..=12288).suffix(" MB")).changed() {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                let auto_lbl = format!(
+                                                                    "Dynamic Auto-RAM (Live: {} MB of {:.1} GB free • {:.1} GB reserved for OS)",
+                                                                    self.ram_plan.recommended_mb,
+                                                                    self.ram_plan.available_mb as f64 / 1024.0,
+                                                                    self.ram_plan.reserved_mb as f64 / 1024.0
+                                                                );
+                                                                if ui.checkbox(&mut self.cfg.auto_ram, auto_lbl).changed() {
                                                                     cfg_dirty = true;
                                                                 }
+                                                            });
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(RichText::new("Manual RAM:").size(12.0).color(TEXT_SECONDARY));
+                                                                ui.add_enabled_ui(!self.cfg.auto_ram, |ui| {
+                                                                    if ui.add(egui::Slider::new(&mut self.cfg.srep_ram_mb, 1024..=12288).suffix(" MB")).changed() {
+                                                                        cfg_dirty = true;
+                                                                    }
+                                                                });
                                                                 ui.separator();
-                                                                ui.label(RichText::new("Drive:").size(12.0).color(TEXT_SECONDARY));
+                                                                ui.label(RichText::new("Stream Drive:").size(12.0).color(TEXT_SECONDARY));
                                                                 if ui.add(egui::TextEdit::singleline(&mut self.cfg.virtual_drive).desired_width(34.0)).changed() {
                                                                     cfg_dirty = true;
                                                                 }
@@ -1182,8 +1345,10 @@ impl eframe::App for ArcSteamApp {
                                                                         .map(|n| n.to_string_lossy().to_string())
                                                                         .unwrap_or_else(|| p.display().to_string());
                                                                     job.local_source_dir = p;
+                                                                    job.start_menu_folder = job.display_name.clone();
                                                                     job.detected_format = fmt;
                                                                     job.selected_files = entries;
+                                                                    job.excluded_games.clear();
                                                                     self.queue.push(QueueEntry {
                                                                         config: job,
                                                                         state: QueueItemState::Queued,
@@ -1264,14 +1429,165 @@ impl eframe::App for ArcSteamApp {
                                                         }
                                                     }
 
+                                                    MainTab::Installed => {
+                                                        ui.vertical_centered(|ui| {
+                                                            ui.label(RichText::new("Clean Uninstaller & Library Manager").size(12.0).color(TEXT_SECONDARY));
+                                                            ui.label(Self::semibold("Installed Games", 24.0, TEXT_PRIMARY));
+                                                        });
+                                                        ui.add_space(10.0);
+
+                                                        if uninst_busy {
+                                                            ui.label(Self::semibold("Uninstalling game files...", 13.0, ACCENT_SOFT));
+                                                            ui.add_space(8.0);
+                                                        }
+
+                                                        if self.installed_manifests.is_empty() {
+                                                            ui.vertical_centered(|ui| {
+                                                                ui.add_space(22.0);
+                                                                ui.label(
+                                                                    RichText::new("No games registered by ArcSteam yet.")
+                                                                        .color(TEXT_SECONDARY),
+                                                                );
+                                                                ui.add_space(4.0);
+                                                                ui.label(
+                                                                    RichText::new("Games installed with v9+ appear here automatically (or click Tools -> Run Post-Unpack Builders & Repair to register an existing game).")
+                                                                        .size(11.5)
+                                                                        .color(TEXT_DIM),
+                                                                );
+                                                                ui.add_space(22.0);
+                                                            });
+                                                        } else {
+                                                            let snapshot = self.installed_manifests.clone();
+                                                            let mut trigger_action: Option<(InstallManifest, UninstallMode)> = None;
+
+                                                            for m in &snapshot {
+                                                                let is_confirming = self.uninstall_target_id.as_deref() == Some(m.id.as_str());
+                                                                Frame::new()
+                                                                    .fill(SURFACE_INPUT)
+                                                                    .stroke(Stroke::new(
+                                                                        1.0,
+                                                                        if is_confirming { ACCENT_MAIN } else { BORDER_SUBTLE },
+                                                                    ))
+                                                                    .corner_radius(CornerRadius::same(12))
+                                                                    .inner_margin(Margin::same(12))
+                                                                    .show(ui, |ui| {
+                                                                        ui.horizontal(|ui| {
+                                                                            ui.vertical(|ui| {
+                                                                                ui.label(Self::semibold(&m.display_name, 14.0, TEXT_PRIMARY));
+                                                                                let path_preview = m
+                                                                                    .game_dirs
+                                                                                    .iter()
+                                                                                    .map(|p| p.display().to_string())
+                                                                                    .collect::<Vec<_>>()
+                                                                                    .join("  |  ");
+                                                                                ui.label(
+                                                                                    RichText::new(format!(
+                                                                                        "{}  •  {} shortcut(s)  •  {} reg key(s)",
+                                                                                        path_preview,
+                                                                                        m.shortcuts.len(),
+                                                                                        m.registry_keys.len()
+                                                                                    ))
+                                                                                    .size(11.2)
+                                                                                    .color(TEXT_SECONDARY),
+                                                                                );
+                                                                            });
+                                                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                                                if !is_confirming {
+                                                                                    if ui
+                                                                                        .add_enabled(
+                                                                                            !uninst_busy,
+                                                                                            egui::Button::new(Self::semibold("Uninstall", 12.0, Color32::WHITE))
+                                                                                                .fill(Color32::from_rgb(165, 36, 52)),
+                                                                                        )
+                                                                                        .clicked()
+                                                                                    {
+                                                                                        self.uninstall_target_id = Some(m.id.clone());
+                                                                                    }
+                                                                                }
+                                                                                if let Some(first_dir) = m.game_dirs.first() {
+                                                                                    if first_dir.exists() && ui.button("Open").clicked() {
+                                                                                        win_sys::open_in_explorer(first_dir);
+                                                                                    }
+                                                                                }
+                                                                            });
+                                                                        });
+
+                                                                        if is_confirming {
+                                                                            ui.add_space(8.0);
+                                                                            ui.separator();
+                                                                            ui.add_space(6.0);
+                                                                            let sz = manifest::quick_dir_size_bytes(&m.game_dirs);
+                                                                            let profiles = manifest::discover_related_profile_dirs(m);
+                                                                            ui.label(
+                                                                                RichText::new(format!(
+                                                                                    "Game size: {}  •  Detected {} profile/save folder(s)  •  {} registry key(s)",
+                                                                                    detect::format_bytes(sz),
+                                                                                    profiles.len(),
+                                                                                    m.registry_keys.len()
+                                                                                ))
+                                                                                .size(11.5)
+                                                                                .color(ACCENT_SOFT),
+                                                                            );
+                                                                            if !profiles.is_empty() {
+                                                                                for pd in &profiles {
+                                                                                    ui.label(
+                                                                                        RichText::new(format!("  Profile/Saves: {}", pd.display()))
+                                                                                            .size(11.0)
+                                                                                            .color(TEXT_SECONDARY),
+                                                                                    );
+                                                                                }
+                                                                            }
+                                                                            ui.add_space(8.0);
+                                                                            ui.horizontal_wrapped(|ui| {
+                                                                                if ui
+                                                                                    .add(
+                                                                                        egui::Button::new(Self::semibold(
+                                                                                            "Uninstall (Keep Saves & Profile)",
+                                                                                            12.0,
+                                                                                            Color32::WHITE,
+                                                                                        ))
+                                                                                        .fill(ACCENT_MAIN),
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    trigger_action = Some((m.clone(), UninstallMode::KeepProfile));
+                                                                                }
+                                                                                if ui
+                                                                                    .add(
+                                                                                        egui::Button::new(Self::semibold(
+                                                                                            "Complete Wipe (Delete Game + Saves + Registry)",
+                                                                                            12.0,
+                                                                                            Color32::WHITE,
+                                                                                        ))
+                                                                                        .fill(Color32::from_rgb(190, 34, 48)),
+                                                                                    )
+                                                                                    .clicked()
+                                                                                {
+                                                                                    trigger_action = Some((m.clone(), UninstallMode::DeleteEverything));
+                                                                                }
+                                                                                if ui.button("Cancel").clicked() {
+                                                                                    self.uninstall_target_id = None;
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    });
+                                                                ui.add_space(6.0);
+                                                            }
+
+                                                            if let Some((m, mode)) = trigger_action {
+                                                                self.trigger_uninstall(m, mode);
+                                                            }
+                                                        }
+                                                    }
+
                                                     MainTab::Tools => {
                                                         ui.vertical_centered(|ui| {
-                                                            ui.label(RichText::new("Integrity Check & Fast Backup").size(12.0).color(TEXT_SECONDARY));
+                                                            ui.label(RichText::new("Post-Unpack Repair, Integrity & Zstd Vault").size(12.0).color(TEXT_SECONDARY));
                                                             ui.label(Self::semibold("Repack Tools", 24.0, TEXT_PRIMARY));
                                                         });
-                                                        ui.add_space(14.0);
+                                                        ui.add_space(12.0);
 
-                                                        // 1-Click Post-Install Finalizer & Runtime Check (fixes 0xc0000142 & splash hangs)
+                                                        // 1-Click Post-Unpack Builder & Repair + Runtime Status
                                                         ui.horizontal_wrapped(|ui| {
                                                             let can_repair = !running
                                                                 && !self.cfg.local_source.as_os_str().is_empty()
@@ -1279,15 +1595,14 @@ impl eframe::App for ArcSteamApp {
                                                             if ui
                                                                 .add_enabled(
                                                                     can_repair,
-                                                                    egui::Button::new("Replay setup.exe Metadata & Fix Launch"),
+                                                                    egui::Button::new("Run Post-Unpack Builders & Repair"),
                                                                 )
                                                                 .clicked()
                                                             {
                                                                 self.show_logs = true;
+                                                                let j = self.build_current_job(false);
                                                                 pipeline::spawn_repair_existing_thread(
-                                                                    self.cfg.local_source.clone(),
-                                                                    self.cfg.target_game_dir.clone(),
-                                                                    self.cfg.temp_ssd_dir.clone(),
+                                                                    j,
                                                                     self.telemetry.clone(),
                                                                 );
                                                             }
@@ -1480,13 +1795,24 @@ fn load_app_icon() -> egui::IconData {
     }
 }
 
+fn parse_uninstall_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg.eq_ignore_ascii_case("--uninstall") {
+            return args.next();
+        }
+    }
+    None
+}
+
 fn main() -> eframe::Result {
     let _winfsp_init = winfsp::winfsp_init();
+    let initial_uninstall = parse_uninstall_arg();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([860.0, 680.0])
-            .with_min_inner_size([680.0, 560.0])
+            .with_inner_size([880.0, 700.0])
+            .with_min_inner_size([700.0, 580.0])
             .with_drag_and_drop(true)
             .with_icon(load_app_icon()),
         ..Default::default()
@@ -1495,10 +1821,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ArcSteam",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             ArcSteamApp::configure_theme(&cc.egui_ctx);
-            Ok(Box::new(ArcSteamApp::default()))
+            Ok(Box::new(ArcSteamApp::new(initial_uninstall)))
         }),
     )
 }

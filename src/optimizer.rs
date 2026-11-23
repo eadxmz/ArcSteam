@@ -18,6 +18,14 @@ pub enum PeBitness {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicRamPlan {
+    pub recommended_mb: u64,
+    pub available_mb: u64,
+    pub total_mb: u64,
+    pub reserved_mb: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SrepPatchReport {
     pub effective_ram_mb: u64,
@@ -138,11 +146,38 @@ pub fn inspect_pe_bitness(exe_path: &Path) -> PeBitness {
     }
 }
 
-pub fn optimal_srep_ram_mb() -> u64 {
-    let mut sys = System::new_all();
+/// Dynamically computes the highest safe SREP memory budget from live available RAM
+/// while reserving headroom (`max(2048 MB, 22% of total RAM)`) so Windows stays responsive
+/// and never thrashes the pagefile.
+pub fn compute_dynamic_srep_ram() -> DynamicRamPlan {
+    let mut sys = System::new();
     sys.refresh_memory();
-    let avail_mb = sys.available_memory() / (1024 * 1024);
-    ((avail_mb as f64) * 0.65).clamp(1536.0, 12288.0) as u64
+    let total_mb = (sys.total_memory() / (1024 * 1024)).max(2048);
+    let available_mb = sys.available_memory() / (1024 * 1024);
+
+    let reserved_mb = ((total_mb as f64) * 0.22).max(2048.0) as u64;
+    let ceiling_mb = ((total_mb as f64) * 0.65) as u64;
+
+    let raw_budget = if available_mb > reserved_mb + 1024 {
+        (available_mb - reserved_mb).min(ceiling_mb)
+    } else {
+        ((available_mb as f64) * 0.55) as u64
+    };
+
+    // Round down to clean 128 MB step, clamped safely to [1024, 12288] MB
+    let stepped = (raw_budget / 128) * 128;
+    let recommended_mb = stepped.clamp(1024, 12288);
+
+    DynamicRamPlan {
+        recommended_mb,
+        available_mb,
+        total_mb,
+        reserved_mb,
+    }
+}
+
+pub fn optimal_srep_ram_mb() -> u64 {
+    compute_dynamic_srep_ram().recommended_mb
 }
 
 pub fn logical_cpu_threads() -> usize {
@@ -191,11 +226,6 @@ fn read_ini_lossy(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Section-aware CLS.ini Turbo Optimizer:
-/// - Unlocks `MaxThreadsUsage=100%` across `[lolz]`, `[magic2]`, `[magic2l]`, `[srep]`
-/// - Bumps shared-memory IPC `transfer_ReadBufSize` / `transfer_WriteBufSize` to `4m`
-/// - Bumps `[srep]` `Bufsize` to `32m` and other CLS `Bufsize` to `4m`
-/// - Routes all `TempPath=` & `{app}`/`{tmp}` placeholders to the fastest SSD swap folder
 fn optimize_cls_ini_text(
     raw: &str,
     temp_with_slash: &str,

@@ -1,12 +1,14 @@
 use crate::detect::{self, ArchiveMagic, RepackFileEntry, RepackFormat};
 use crate::dissect;
 use crate::embedded_tools;
+use crate::manifest::{self, InstallManifest};
 use crate::optimizer::{self, DefenderExclusionGuard};
 use crate::stream_bridge::{self, TorrentStreamFs, VirtualTorrentFile};
 use crate::win_sys::{self, HighPerformanceGuard, JobHandle, KeepAwakeGuard, PostQueueAction};
 use anyhow::{Context, Result};
 use librqbit::{AddTorrent, AddTorrentOptions, Api, Session};
 use regex::Regex;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -28,9 +30,13 @@ pub struct JobConfig {
     pub defender_bypass: bool,
     pub replay_registry: bool,
     pub create_shortcuts: bool,
+    pub create_start_menu: bool,
+    pub start_menu_folder: String,
     pub auto_clean_temp: bool,
+    pub auto_ram: bool,
     pub srep_ram_mb: u64,
     pub selected_files: Vec<RepackFileEntry>,
+    pub excluded_games: Vec<String>,
     pub detected_format: RepackFormat,
 }
 
@@ -114,6 +120,7 @@ pub struct SharedTelemetry {
     pub stage_label: String,
     pub active_queue_idx: Option<usize>,
     pub queue_states: Vec<QueueItemState>,
+    pub manifests_dirty: bool,
     pub logs: Vec<String>,
 }
 
@@ -149,15 +156,6 @@ fn set_progress(
             s.stage_label = st.to_string();
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn tools_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("tools")))
-        .filter(|d| d.exists())
-        .unwrap_or_else(|| PathBuf::from("tools"))
 }
 
 pub fn spawn_queue_thread(
@@ -252,6 +250,7 @@ pub fn spawn_queue_thread(
                         if let Some(st) = s.queue_states.get_mut(idx) {
                             *st = QueueItemState::Done;
                         }
+                        s.manifests_dirty = true;
                     }
                     set_progress(&shared, Some(1.0), Some(1.0), Some("Completed"));
                     push_log(&shared, format!("[DONE] {} finished cleanly.", cfg.display_name));
@@ -480,6 +479,10 @@ pub fn run_local_turbo_pipeline(
     std::fs::create_dir_all(&cfg.fast_temp_dir)?;
     std::fs::create_dir_all(&cfg.target_game_dir)?;
 
+    // Snapshot existing directories inside target_game_dir BEFORE extraction so the uninstaller
+    // knows the exact game folder(s) created by this install (never deleting sibling games!).
+    let dirs_before = manifest::snapshot_top_dirs(&cfg.target_game_dir);
+
     let work_dir = cfg.fast_temp_dir.join("arcsteam_work");
     if work_dir.exists() {
         let _ = std::fs::remove_dir_all(&work_dir);
@@ -521,6 +524,15 @@ pub fn run_local_turbo_pipeline(
                     setup.display().to_string(),
                 ];
                 run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, control, job_start, 0.1, 0.95)?;
+                let empty_dissected = dissect::DissectedSetup::default();
+                finalize_setup_metadata(
+                    &empty_dissected,
+                    &work_dir,
+                    cfg,
+                    &dirs_before,
+                    shared,
+                    Some(control),
+                )?;
                 cleanup_work_dir(cfg.auto_clean_temp, &work_dir, shared);
                 return Ok(());
             }
@@ -530,11 +542,25 @@ pub fn run_local_turbo_pipeline(
     let mut dissected = dissect::DissectedSetup::default();
     if let Some(setup) = &setup_exe {
         if innounp.exists() {
-            set_progress(shared, None, Some(0.05), Some("Dissecting setup.exe & patching SREP RAM..."));
+            set_progress(shared, None, Some(0.05), Some("Dissecting setup.exe & dynamically tuning RAM..."));
             push_log(shared, format!("[DISSECT] Extracting plugins from {}", setup.display()));
             dissected = dissect::dissect_inno_setup(&innounp, setup, &work_dir)?;
             if dissected.has_unarc_payload {
                 let threads = optimizer::logical_cpu_threads();
+                let target_ram_mb = if cfg.auto_ram {
+                    let plan = optimizer::compute_dynamic_srep_ram();
+                    push_log(
+                        shared,
+                        format!(
+                            "[RAM-AUTO] Live free: {} MB / {} MB total -> allocating {} MB to SREP ({} MB reserved for OS)",
+                            plan.available_mb, plan.total_mb, plan.recommended_mb, plan.reserved_mb
+                        ),
+                    );
+                    plan.recommended_mb
+                } else {
+                    cfg.srep_ram_mb
+                };
+
                 let host32 = embedded_tools::resolve_tool("unarc_host32.exe");
                 let active_unarc = if work_dir.join("unarc.dll").exists() && host32.exists() {
                     &host32
@@ -546,33 +572,30 @@ pub fn run_local_turbo_pipeline(
                     &tools,
                     active_unarc,
                     &cfg.fast_temp_dir,
-                    cfg.srep_ram_mb,
+                    target_ram_mb,
                     threads,
                 )?;
                 if let Some(ref s64) = report.external_srep64_used {
                     push_log(
                         shared,
                         format!(
-                            "[PATCH] External 64-bit {s64} active | SREP RAM -> {} MB | Threads -> {} | Swap -> {}",
-                            report.effective_ram_mb,
-                            threads,
-                            cfg.fast_temp_dir.display()
+                            "[PATCH] External 64-bit {s64} active | SREP RAM -> {} MB | Threads -> 100% ({}) | IPC -> 4m/32m",
+                            report.effective_ram_mb, threads
                         ),
                     );
                 } else if report.clamped_for_32bit {
                     push_log(
                         shared,
                         format!(
-                            "[WARN] unarc.exe is {:?} and no 64-bit srep64.exe found in tools/. Clamped SREP RAM to {} MB to prevent 32-bit OOM crash.",
-                            report.unarc_bitness,
-                            report.effective_ram_mb
+                            "[WARN] unarc is {:?} without 64-bit srep helper; clamped SREP RAM to {} MB to prevent OOM.",
+                            report.unarc_bitness, report.effective_ram_mb
                         ),
                     );
                 } else {
                     push_log(
                         shared,
                         format!(
-                            "[PATCH] SREP RAM -> {} MB ({:?}) | Threads -> {} | Swap -> {}",
+                            "[PATCH] SREP RAM -> {} MB ({:?}) | Threads -> 100% ({}) | Swap -> {}",
                             report.effective_ram_mb,
                             report.unarc_bitness,
                             threads,
@@ -616,8 +639,6 @@ pub fn run_local_turbo_pipeline(
     let unpack_clock = Instant::now();
     set_progress(shared, None, Some(0.0), None);
 
-    // Partition archives: heavy/primary or CLS-backed packs run solo at 100% threads + full RAM;
-    // smaller non-CLS secondary archives (< 600 MB) run 2-at-a-time in isolated worker directories.
     let mut serial_items: Vec<(usize, PathBuf, u64, ArchiveMagic)> = Vec::new();
     let mut parallel_items: Vec<(usize, PathBuf, u64, ArchiveMagic)> = Vec::new();
     let allow_parallel = optimizer::logical_cpu_threads() >= 4;
@@ -638,14 +659,13 @@ pub fn run_local_turbo_pipeline(
         }
     }
 
-    // 1. Run primary / heavy / CLS archives sequentially
     for (idx, archive_path, sz, magic) in serial_items {
         if control.cancel_requested.load(Ordering::Relaxed) {
             anyhow::bail!("Cancelled by user");
         }
         let done_before = completed_bytes.load(Ordering::Relaxed);
-        let start_p = (done_before as f64 / total_archive_bytes as f64) as f32 * 0.96;
-        let end_p = ((done_before + sz) as f64 / total_archive_bytes as f64) as f32 * 0.96;
+        let start_p = (done_before as f64 / total_archive_bytes as f64) as f32 * 0.94;
+        let end_p = ((done_before + sz) as f64 / total_archive_bytes as f64) as f32 * 0.94;
         let fname = archive_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -672,6 +692,7 @@ pub fn run_local_turbo_pipeline(
             &archive_path,
             &cfg.target_game_dir,
             &cfg.fast_temp_dir,
+            &cfg.excluded_games,
             shared,
             control,
             unpack_clock,
@@ -686,7 +707,6 @@ pub fn run_local_turbo_pipeline(
         }
     }
 
-    // 2. Run small non-CLS secondary archives 2-at-a-time in isolated worker folders
     if parallel_items.len() >= 2 {
         push_log(
             shared,
@@ -731,6 +751,7 @@ pub fn run_local_turbo_pipeline(
                     let pwd_ref = dissected.archive_password.as_deref();
                     let has_unarc = dissected.has_unarc_payload;
                     let dst_ref = &cfg.target_game_dir;
+                    let excl_ref = &cfg.excluded_games;
 
                     s.spawn(move || {
                         let _ = copy_dir_flat(src_work, &slot_work);
@@ -740,8 +761,8 @@ pub fn run_local_turbo_pipeline(
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let cur = completed_ref.load(Ordering::Relaxed);
-                        let sp = (cur as f64 / total_archive_bytes as f64) as f32 * 0.96;
-                        let ep = ((cur + *sz) as f64 / total_archive_bytes as f64) as f32 * 0.96;
+                        let sp = (cur as f64 / total_archive_bytes as f64) as f32 * 0.94;
+                        let ep = ((cur + *sz) as f64 / total_archive_bytes as f64) as f32 * 0.94;
 
                         push_log(&shared_ref, format!("[PARALLEL-{slot}] Unpacking {fname}"));
                         let res = extract_single_archive(
@@ -757,6 +778,7 @@ pub fn run_local_turbo_pipeline(
                             archive_path,
                             dst_ref,
                             &slot_swap,
+                            excl_ref,
                             &shared_ref,
                             &ctrl_ref,
                             unpack_clock,
@@ -770,7 +792,7 @@ pub fn run_local_turbo_pipeline(
                         match res {
                             Ok(_) => {
                                 let new_done = completed_ref.fetch_add(*sz, Ordering::Relaxed) + *sz;
-                                let overall = (new_done as f64 / total_archive_bytes as f64) as f32 * 0.96;
+                                let overall = (new_done as f64 / total_archive_bytes as f64) as f32 * 0.94;
                                 set_progress(&shared_ref, None, Some(overall), None);
                             }
                             Err(e) => {
@@ -795,8 +817,8 @@ pub fn run_local_turbo_pipeline(
                 anyhow::bail!("Cancelled by user");
             }
             let done_before = completed_bytes.load(Ordering::Relaxed);
-            let start_p = (done_before as f64 / total_archive_bytes as f64) as f32 * 0.96;
-            let end_p = ((done_before + sz) as f64 / total_archive_bytes as f64) as f32 * 0.96;
+            let start_p = (done_before as f64 / total_archive_bytes as f64) as f32 * 0.94;
+            let end_p = ((done_before + sz) as f64 / total_archive_bytes as f64) as f32 * 0.94;
             let fname = archive_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -823,6 +845,7 @@ pub fn run_local_turbo_pipeline(
                 &archive_path,
                 &cfg.target_game_dir,
                 &cfg.fast_temp_dir,
+                &cfg.excluded_games,
                 shared,
                 control,
                 unpack_clock,
@@ -834,15 +857,11 @@ pub fn run_local_turbo_pipeline(
         }
     }
 
-    // 3. Finalize: deploy setup.exe embedded {app}/{userdocs} files, create [Dirs],
-    //    apply 32-bit WOW6432Node + 64-bit [Registry] keys, create shortcuts, run safe post-patchers
     finalize_setup_metadata(
         &dissected,
         &work_dir,
-        &cfg.target_game_dir,
-        &cfg.fast_temp_dir,
-        cfg.replay_registry,
-        cfg.create_shortcuts,
+        cfg,
+        &dirs_before,
         shared,
         Some(control),
     )?;
@@ -851,61 +870,65 @@ pub fn run_local_turbo_pipeline(
     Ok(())
 }
 
-/// Replays setup.exe's embedded `{app}`/`{userdocs}` files, `[Dirs]`, 32/64-bit `[Registry]` keys,
-/// and checks required legacy DirectX/VC++ runtimes on an already-unpacked game folder in seconds.
+/// Runs post-unpack reconstruction builders (`work\work\build01.bat`), deploys setup.exe metadata,
+/// creates shortcuts, and generates an ArcSteam Uninstall manifest for an already-unpacked game.
 pub fn spawn_repair_existing_thread(
-    repack_dir: PathBuf,
-    target_game_dir: PathBuf,
-    fast_temp_dir: PathBuf,
+    cfg: JobConfig,
     shared: Arc<Mutex<SharedTelemetry>>,
 ) {
     std::thread::spawn(move || {
         if let Ok(mut s) = shared.lock() {
             s.running = true;
             s.unpack_pct = 0.2;
-            s.stage_label = "Repairing game metadata & checking runtimes...".into();
+            s.stage_label = "Running post-unpack builders & finalizing metadata...".into();
         }
         let res = (|| -> Result<()> {
             let innounp = embedded_tools::resolve_tool("innounp.exe");
-            let (_, entries) = detect::scan_local_directory(&repack_dir);
+            let (_, entries) = detect::scan_local_directory(&cfg.local_source_dir);
             let setup_exe = entries
                 .iter()
                 .find(|e| e.is_setup_exe)
-                .map(|e| resolve_source_file(&repack_dir, &e.rel_path));
+                .map(|e| resolve_source_file(&cfg.local_source_dir, &e.rel_path));
 
-            let work_dir = fast_temp_dir.join("arcsteam_repair_work");
+            let work_dir = cfg.fast_temp_dir.join("arcsteam_repair_work");
             if work_dir.exists() {
                 let _ = std::fs::remove_dir_all(&work_dir);
             }
             std::fs::create_dir_all(&work_dir)?;
 
-            if let Some(setup) = setup_exe {
+            let empty_before = HashSet::new();
+            let dissected = if let Some(setup) = setup_exe {
                 if innounp.exists() {
                     push_log(&shared, format!("[REPAIR] Dissecting {}", setup.display()));
-                    let dissected = dissect::dissect_inno_setup(&innounp, &setup, &work_dir)?;
-                    finalize_setup_metadata(
-                        &dissected,
-                        &work_dir,
-                        &target_game_dir,
-                        &fast_temp_dir,
-                        true,
-                        true,
-                        &shared,
-                        None,
-                    )?;
+                    dissect::dissect_inno_setup(&innounp, &setup, &work_dir)?
+                } else {
+                    dissect::DissectedSetup::default()
                 }
             } else {
-                push_log(&shared, "[REPAIR] No setup.exe found — running runtime check only.");
-                log_missing_runtimes(&shared);
-            }
+                push_log(&shared, "[REPAIR] No setup.exe found — scanning for post-unpack scripts & runtimes.");
+                dissect::DissectedSetup::default()
+            };
+
+            finalize_setup_metadata(
+                &dissected,
+                &work_dir,
+                &cfg,
+                &empty_before,
+                &shared,
+                None,
+            )?;
+
             let _ = std::fs::remove_dir_all(&work_dir);
             Ok(())
         })();
 
         match res {
             Ok(()) => {
-                set_progress(&shared, None, Some(1.0), Some("Repair complete"));
-                push_log(&shared, "[DONE] Game metadata finalized & runtime check finished.");
+                if let Ok(mut s) = shared.lock() {
+                    s.manifests_dirty = true;
+                }
+                set_progress(&shared, None, Some(1.0), Some("Repair & rebuild complete"));
+                push_log(&shared, "[DONE] Post-unpack builders, metadata & uninstall registration finished.");
             }
             Err(e) => {
                 set_progress(&shared, None, None, Some("Repair failed"));
@@ -928,29 +951,91 @@ fn log_missing_runtimes(shared: &Arc<Mutex<SharedTelemetry>>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finalize_setup_metadata(
     dissected: &dissect::DissectedSetup,
     work_dir: &Path,
-    target_game_dir: &Path,
-    fast_temp_dir: &Path,
-    replay_registry: bool,
-    create_shortcuts: bool,
+    cfg: &JobConfig,
+    dirs_before: &HashSet<String>,
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: Option<&Arc<PipelineControl>>,
 ) -> Result<()> {
-    set_progress(shared, None, Some(0.96), Some("Deploying setup files, dirs & registry..."));
+    let target_game_dir = &cfg.target_game_dir;
+    let fast_temp_dir = &cfg.fast_temp_dir;
+    let excluded_games = &cfg.excluded_games;
 
-    let embedded_copied = dissect::deploy_embedded_setup_files(work_dir, target_game_dir);
+    // 1. Execute FitGirl/DODI post-unpack reconstruction scripts (e.g. work\work\build01.bat)
+    let builder_scripts = dissect::discover_post_unpack_scripts(target_game_dir);
+    if !builder_scripts.is_empty() {
+        let mut ran_work_builder = false;
+        for (i, bat_path) in builder_scripts.iter().enumerate() {
+            if let Some(ctrl) = control {
+                if ctrl.cancel_requested.load(Ordering::Relaxed) {
+                    anyhow::bail!("Cancelled by user");
+                }
+            }
+            let bname = bat_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "build.bat".into());
+            set_progress(
+                shared,
+                None,
+                Some(0.95),
+                Some(&format!(
+                    "Rebuilding game data ({}/{}: {bname})...",
+                    i + 1,
+                    builder_scripts.len()
+                )),
+            );
+            push_log(
+                shared,
+                format!("[REBUILD] Executing post-unpack builder: {}", bat_path.display()),
+            );
+            run_post_unpack_bat(bat_path, target_game_dir, work_dir, fast_temp_dir, shared, control);
+            if bat_path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("\\work\\")
+            {
+                ran_work_builder = true;
+            }
+        }
+
+        if ran_work_builder {
+            let game_work = target_game_dir.join("work");
+            if game_work.is_dir() && std::fs::remove_dir_all(&game_work).is_ok() {
+                push_log(shared, "[CLEANUP] Removed post-unpack work\\ folder.");
+            }
+        }
+    }
+
+    // Remove residual folders for any excluded games
+    for ex in excluded_games {
+        let ex_dir = target_game_dir.join(ex);
+        if ex_dir.is_dir() {
+            let _ = std::fs::remove_dir_all(&ex_dir);
+            push_log(shared, format!("[SKIP] Excluded unselected game: {ex}"));
+        }
+    }
+
+    set_progress(shared, None, Some(0.98), Some("Deploying setup files, shortcuts & uninstall manifest..."));
+
+    let mut tracked_profiles: Vec<PathBuf> = Vec::new();
+
+    let (embedded_copied, ext_profiles) =
+        dissect::deploy_embedded_setup_files(work_dir, target_game_dir, excluded_games);
+    tracked_profiles.extend(ext_profiles);
     if embedded_copied > 0 {
         push_log(
             shared,
-            format!("[SETUP] Deployed {embedded_copied} embedded file(s) from setup.exe ({{app}}/{{userdocs}})."),
+            format!("[SETUP] Deployed {embedded_copied} embedded file(s) from setup.exe."),
         );
     }
 
     if !dissected.dir_entries.is_empty() {
-        let dir_count = dissect::create_script_dirs(&dissected.dir_entries, target_game_dir, work_dir);
+        let (dir_count, dir_profiles) =
+            dissect::create_script_dirs(&dissected.dir_entries, target_game_dir, work_dir);
+        tracked_profiles.extend(dir_profiles);
         if dir_count > 0 {
             push_log(
                 shared,
@@ -959,23 +1044,61 @@ fn finalize_setup_metadata(
         }
     }
 
-    if replay_registry && !dissected.registry_entries.is_empty() {
-        let count = dissect::apply_registry_entries(
+    let mut tracked_reg_keys: Vec<String> = Vec::new();
+    if cfg.replay_registry && !dissected.registry_entries.is_empty() {
+        let (count, keys) = dissect::apply_registry_entries(
             &dissected.registry_entries,
             target_game_dir,
             work_dir,
         );
+        tracked_reg_keys = keys;
         push_log(
             shared,
             format!("[REG] Applied {count} game registry key(s) (32-bit WOW6432Node + 64-bit)."),
         );
     }
 
-    if create_shortcuts && !dissected.icon_entries.is_empty() {
-        let created = dissect::create_desktop_shortcuts(&dissected.icon_entries, target_game_dir);
-        if created > 0 {
-            push_log(shared, format!("[SHORTCUT] Created {created} Desktop shortcut(s)."));
+    let manifest_id = manifest::sanitize_id(&cfg.display_name);
+    let mut tracked_shortcuts: Vec<PathBuf> = Vec::new();
+
+    if cfg.create_shortcuts && !dissected.icon_entries.is_empty() {
+        let desk_lnks =
+            dissect::create_desktop_shortcuts(&dissected.icon_entries, target_game_dir, excluded_games);
+        if !desk_lnks.is_empty() {
+            push_log(
+                shared,
+                format!("[SHORTCUT] Created {} Desktop shortcut(s).", desk_lnks.len()),
+            );
+            tracked_shortcuts.extend(desk_lnks);
         }
+    }
+
+    let mut tracked_start_menu: Option<PathBuf> = None;
+    if cfg.create_start_menu {
+        let sm_name = if cfg.start_menu_folder.trim().is_empty() {
+            cfg.display_name.as_str()
+        } else {
+            cfg.start_menu_folder.trim()
+        };
+        let (sm_dir, sm_lnks) = dissect::create_start_menu_shortcuts(
+            &dissected.icon_entries,
+            target_game_dir,
+            excluded_games,
+            sm_name,
+            &manifest_id,
+        );
+        if let Some(ref d) = sm_dir {
+            push_log(
+                shared,
+                format!(
+                    "[STARTMENU] Created Start Menu folder '{}' ({} shortcut(s)).",
+                    d.file_name().unwrap_or_default().to_string_lossy(),
+                    sm_lnks.len()
+                ),
+            );
+        }
+        tracked_start_menu = sm_dir;
+        tracked_shortcuts.extend(sm_lnks);
     }
 
     for post in &dissected.safe_post_run {
@@ -1006,12 +1129,133 @@ fn finalize_setup_metadata(
         }
     }
 
+    // Determine the exact game folder(s) owned by this installation for safe future uninstallation
+    let mut owned_game_dirs = if !dirs_before.is_empty() {
+        manifest::diff_new_top_dirs(target_game_dir, dirs_before, excluded_games)
+    } else {
+        // In repair mode or when target folder was empty, infer from [Icons] top-level folders first
+        let mut from_icons = Vec::new();
+        let mut seen = HashSet::new();
+        for ic in &dissected.icon_entries {
+            let trimmed = ic.filename.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("{app}\\") || lower.starts_with("{app}/") {
+                if let Some((seg, _)) = trimmed[6..].split_once('\\').or_else(|| trimmed[6..].split_once('/')) {
+                    let cand = target_game_dir.join(seg);
+                    let sl = seg.to_ascii_lowercase();
+                    let is_ex = excluded_games.iter().any(|e| e.to_ascii_lowercase() == sl);
+                    if cand.is_dir() && !is_ex && seen.insert(sl) {
+                        from_icons.push(cand);
+                    }
+                }
+            }
+        }
+        from_icons
+    };
+
+    if owned_game_dirs.is_empty() {
+        owned_game_dirs.push(target_game_dir.to_path_buf());
+    }
+
+    let uninstall_reg_key = format!(
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ArcSteam_{manifest_id}"
+    );
+    let install_manifest = InstallManifest {
+        id: manifest_id,
+        display_name: cfg.display_name.clone(),
+        install_root: target_game_dir.to_path_buf(),
+        game_dirs: owned_game_dirs,
+        start_menu_dir: tracked_start_menu,
+        shortcuts: tracked_shortcuts,
+        profile_dirs: tracked_profiles,
+        registry_keys: tracked_reg_keys,
+        uninstall_reg_key,
+    };
+
+    if manifest::save_manifest(&install_manifest).is_ok() {
+        manifest::register_windows_uninstall_entry(&install_manifest);
+        push_log(
+            shared,
+            format!(
+                "[MANIFEST] Registered '{}' in ArcSteam Installed & Windows Apps (Uninstall ready).",
+                install_manifest.display_name
+            ),
+        );
+    }
+
     log_missing_runtimes(shared);
     Ok(())
 }
 
-/// Checks the last 256 KB descriptor of an archive for CLS external-codec signatures.
-/// CLS codecs share fixed named mappings and already multithread at 100%, so they run solo.
+fn run_post_unpack_bat(
+    bat_path: &Path,
+    target_game_dir: &Path,
+    work_dir: &Path,
+    fast_temp_dir: &Path,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    control: Option<&Arc<PipelineControl>>,
+) {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let (cwd, needs_app_arg) = dissect::detect_script_cwd_and_args(bat_path, target_game_dir);
+    let bat_dir = bat_path.parent().unwrap_or(target_game_dir);
+
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!(
+        "{};{};{};{}",
+        bat_dir.display(),
+        work_dir.display(),
+        embedded_tools::bin_dir().display(),
+        orig_path
+    );
+
+    let mut cmd = Command::new("cmd.exe");
+    cmd.arg("/c").arg(bat_path);
+    if needs_app_arg {
+        cmd.arg(target_game_dir);
+    }
+    cmd.current_dir(&cwd)
+        .env("PATH", combined_path)
+        .env("TEMP", fast_temp_dir)
+        .env("TMP", fast_temp_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0000_0080 | 0x0800_0000);
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if let Some(ctrl) = control {
+                attach_job(&child, ctrl);
+            }
+            if let Some(stdout) = child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        push_log(shared, format!("  | {trimmed}"));
+                    }
+                }
+            }
+            match child.wait() {
+                Ok(status) => {
+                    push_log(
+                        shared,
+                        format!("[REBUILD] {} finished (exit {:?}).", bat_path.display(), status.code()),
+                    );
+                }
+                Err(e) => {
+                    push_log(shared, format!("[WARN] Error waiting on builder script: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            push_log(shared, format!("[WARN] Could not launch {}: {e}", bat_path.display()));
+        }
+    }
+}
+
 fn archive_uses_cls(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -1047,6 +1291,24 @@ fn copy_dir_flat(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn cleanup_work_dir(enabled: bool, work_dir: &Path, shared: &Arc<Mutex<SharedTelemetry>>) {
+    if enabled && work_dir.exists() {
+        if std::fs::remove_dir_all(work_dir).is_ok() {
+            push_log(shared, "[CLEANUP] Removed temporary arcsteam_work directory.");
+        }
+    }
+}
+
+fn attach_job(child: &std::process::Child, control: &Arc<PipelineControl>) {
+    control.active_root_pid.store(child.id(), Ordering::Relaxed);
+    if let Some(job) = JobHandle::new() {
+        job.assign_child(child);
+        if let Ok(mut guard) = control.active_job.lock() {
+            *guard = Some(job);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_single_archive(
     magic: ArchiveMagic,
@@ -1061,6 +1323,7 @@ fn extract_single_archive(
     archive_path: &Path,
     target_game_dir: &Path,
     fast_temp_dir: &Path,
+    excluded_games: &[String],
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: &Arc<PipelineControl>,
     unpack_clock: Instant,
@@ -1076,6 +1339,7 @@ fn extract_single_archive(
                 archive_path,
                 target_game_dir,
                 fast_temp_dir,
+                excluded_games,
                 password,
                 shared,
                 control,
@@ -1118,6 +1382,7 @@ fn extract_single_archive(
                 archive_path,
                 target_game_dir,
                 fast_temp_dir,
+                excluded_games,
                 shared,
                 control,
                 unpack_clock,
@@ -1135,6 +1400,7 @@ fn extract_single_archive(
                     archive_path,
                     target_game_dir,
                     fast_temp_dir,
+                    excluded_games,
                     password,
                     shared,
                     control,
@@ -1149,6 +1415,7 @@ fn extract_single_archive(
                     archive_path,
                     target_game_dir,
                     fast_temp_dir,
+                    excluded_games,
                     shared,
                     control,
                     unpack_clock,
@@ -1162,24 +1429,6 @@ fn extract_single_archive(
     }
 }
 
-fn cleanup_work_dir(enabled: bool, work_dir: &Path, shared: &Arc<Mutex<SharedTelemetry>>) {
-    if enabled && work_dir.exists() {
-        if std::fs::remove_dir_all(work_dir).is_ok() {
-            push_log(shared, "[CLEANUP] Removed temporary arcsteam_work directory.");
-        }
-    }
-}
-
-fn attach_job(child: &std::process::Child, control: &Arc<PipelineControl>) {
-    control.active_root_pid.store(child.id(), Ordering::Relaxed);
-    if let Some(job) = JobHandle::new() {
-        job.assign_child(child);
-        if let Ok(mut guard) = control.active_job.lock() {
-            *guard = Some(job);
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_unarc_extract(
     unarc: &Path,
@@ -1187,6 +1436,7 @@ fn run_unarc_extract(
     archive_path: &Path,
     target_game_dir: &Path,
     fast_temp_dir: &Path,
+    excluded_games: &[String],
     password: Option<&str>,
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: &Arc<PipelineControl>,
@@ -1198,8 +1448,6 @@ fn run_unarc_extract(
     let host32 = embedded_tools::resolve_tool("unarc_host32.exe");
     let repack_unarc_dll = work_dir.join("unarc.dll");
 
-    // Preferred path: invoke the repack's OWN unarc.dll via our 32-bit LAA host.
-    // Supports FitGirl, DODI, CODEX, R.G. Mechanics, and custom FreeArc 0.67/modified descriptors!
     if repack_unarc_dll.exists() && host32.exists() {
         push_log(
             shared,
@@ -1214,6 +1462,10 @@ fn run_unarc_extract(
         ];
         if let Some(pwd) = password {
             args.push(format!("-p{pwd}"));
+        }
+        for ex in excluded_games {
+            args.push(format!("-x{ex}\\*"));
+            args.push(format!("-x{ex}"));
         }
         args.push("--".into());
         args.push(archive_path.display().to_string());
@@ -1246,6 +1498,10 @@ fn run_unarc_extract(
     if let Some(pwd) = password {
         args.push(format!("-p{pwd}"));
     }
+    for ex in excluded_games {
+        args.push(format!("-x{ex}\\*"));
+        args.push(format!("-x{ex}"));
+    }
     args.push(archive_path.display().to_string());
     run_and_stream_logs(&local_unarc, &args, Some(work_dir), fast_temp_dir, shared, control, job_start, start_p, end_p)
 }
@@ -1256,6 +1512,7 @@ fn run_7z_extract(
     archive_path: &Path,
     target_game_dir: &Path,
     fast_temp_dir: &Path,
+    excluded_games: &[String],
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: &Arc<PipelineControl>,
     job_start: Instant,
@@ -1264,14 +1521,17 @@ fn run_7z_extract(
     fname: &str,
 ) -> Result<()> {
     if !seven_zip.exists() {
-        anyhow::bail!("tools/7z.exe is required to unpack {fname}");
+        anyhow::bail!("Built-in 7z.exe is required to unpack {fname}");
     }
-    let args = vec![
+    let mut args = vec![
         "x".into(),
         "-y".into(),
         format!("-o{}", target_game_dir.display()),
-        archive_path.display().to_string(),
     ];
+    for ex in excluded_games {
+        args.push(format!("-xr!{ex}"));
+    }
+    args.push(archive_path.display().to_string());
     run_and_stream_logs(seven_zip, &args, None, fast_temp_dir, shared, control, job_start, start_p, end_p)
 }
 
@@ -1320,7 +1580,6 @@ fn run_and_stream_logs(
         .with_context(|| format!("Failed to spawn {}", exe.display()))?;
     attach_job(&child, control);
 
-    // Spawn live anti-"freeze" worker monitor (RAM MB, Disk Write MB/s, Active Worker Name, ETA)
     let root_pid = child.id();
     let monitor_done = Arc::new(AtomicBool::new(false));
     let mon_flag = monitor_done.clone();
