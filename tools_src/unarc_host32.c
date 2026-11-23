@@ -107,7 +107,6 @@ int main(int argc, char **argv) {
     SetCurrentDirectoryA(work_dir);
     SetDllDirectoryA(work_dir);
 
-    /* Explicit permissive security descriptor (NULL DACL) so all 32/64-bit CLS children can open Init_MapFile_ */
     SECURITY_DESCRIPTOR sd;
     InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
@@ -121,7 +120,7 @@ int main(int argc, char **argv) {
     HANDLE hLocalMap = create_cls_init_map("Init_MapFile_", &sa, &localView);
     HANDLE hGlobalMap = create_cls_init_map("Global\\Init_MapFile_", &sa, &globalView);
 
-    printf("[UNARC-HOST] v6.2 | Init_MapFile_=%s | Global\\Init_MapFile_=%s\n",
+    printf("[UNARC-HOST] v8.0 | Init_MapFile_=%s | Global\\Init_MapFile_=%s\n",
            (hLocalMap && localView) ? "OK" : "FAIL",
            (hGlobalMap && globalView) ? "OK" : "FAIL");
     fflush(stdout);
@@ -156,11 +155,11 @@ int main(int argc, char **argv) {
         return 102;
     }
 
-    char *a[12];
+    char *a[24];
     int i;
-    for (i = 0; i < 12; i++) a[i] = NULL;
+    for (i = 0; i < 24; i++) a[i] = NULL;
     int n = argc - 2;
-    if (n > 11) n = 11;
+    if (n > 23) n = 23;
     for (i = 0; i < n; i++) {
         a[i] = argv[i + 2];
     }
@@ -168,7 +167,9 @@ int main(int argc, char **argv) {
     int rc = extract(
         arc_callback,
         a[0], a[1], a[2], a[3], a[4], a[5],
-        a[6], a[7], a[8], a[9], a[10],
+        a[6], a[7], a[8], a[9], a[10], a[11],
+        a[12], a[13], a[14], a[15], a[16], a[17],
+        a[18], a[19], a[20], a[21], a[22], a[23],
         NULL
     );
 
