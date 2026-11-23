@@ -1,6 +1,7 @@
 use crate::detect::{self, ArchiveMagic, RepackFileEntry, RepackFormat};
 use crate::dissect;
 use crate::embedded_tools;
+use crate::ifps::{self, IfpsAction};
 use crate::manifest::{self, InstallManifest};
 use crate::optimizer::{self, DefenderExclusionGuard};
 use crate::stream_bridge::{self, TorrentStreamFs, VirtualTorrentFile};
@@ -584,6 +585,7 @@ pub fn run_local_turbo_pipeline(
                     gog_dissected.icon_entries.push(dissect::IconEntry {
                         name: clean_name.clone(),
                         filename: format!("{{app}}\\{}", rel_exe.display()),
+                        parameters: String::new(),
                         working_dir: String::new(),
                     });
                 }
@@ -1040,8 +1042,38 @@ fn finalize_setup_metadata(
     let fast_temp_dir = &cfg.fast_temp_dir;
     let excluded_games = &cfg.excluded_games;
 
-    // 1. Execute FitGirl/DODI post-unpack reconstruction scripts (e.g. work\work\build01.bat)
-    let builder_scripts = dissect::discover_post_unpack_scripts(target_game_dir);
+    // 1. Replay compiled Inno Setup IFPS post-unpack pipeline (`ISExec` + nested `ISArcExtract`)
+    //    if `embedded\CompiledCode.bin` is present (handles delzo, x5, x2n, x3, builder, sfk, fart,
+    //    build01.bat, and nested `{app}\*.fgpack` archives in exact installer order!).
+    let mut ran_ifps_pipeline = false;
+    let compiled_code_bin = work_dir.join("embedded").join("CompiledCode.bin");
+    if compiled_code_bin.is_file() {
+        let (ifps_actions, ifps_notes) = ifps::extract_post_unpack_actions(&compiled_code_bin);
+        for note in ifps_notes {
+            push_log(shared, note);
+        }
+        if !ifps_actions.is_empty() {
+            ran_ifps_pipeline = true;
+            replay_ifps_post_unpack(
+                &ifps_actions,
+                work_dir,
+                target_game_dir,
+                fast_temp_dir,
+                &cfg.local_source_dir,
+                excluded_games,
+                dissected.archive_password.as_deref(),
+                shared,
+                control,
+            )?;
+        }
+    }
+
+    // 1b. Fallback for repacks without IFPS ISExec steps: run discovered post-unpack build*.bat scripts
+    let builder_scripts = if ran_ifps_pipeline {
+        Vec::new()
+    } else {
+        dissect::discover_post_unpack_scripts(target_game_dir)
+    };
     if !builder_scripts.is_empty() {
         let mut ran_work_builder = false;
         for (i, bat_path) in builder_scripts.iter().enumerate() {
@@ -1118,7 +1150,7 @@ fn finalize_setup_metadata(
     for ex in excluded_games {
         let ex_dir = target_game_dir.join(ex);
         if ex_dir.is_dir() {
-            let _ = std::fs::remove_dir_all(&ex_dir);
+            let _ = manifest::force_remove_dir_all(&ex_dir);
             push_log(shared, format!("[SKIP] Excluded unselected game: {ex}"));
         }
     }
@@ -1918,4 +1950,365 @@ fn process_leftover_fgpacks(
         }
     }
     remaining
+}
+
+fn mirror_work_tools_into_tmp(target_game_dir: &Path, work_dir: &Path) {
+    // Repack archives like fg-06.bin unpack `work\work\*` into `{app}\work\work\`, while
+    // CompiledCode.bin invokes `{tmp}\work\fart.exe`, `{tmp}\work\build01.bat`, etc.
+    // Mirroring `{app}\work\work\` (and `{app}\work\`) into `work_dir\work\` satisfies both!
+    let dst_work = work_dir.join("work");
+    let _ = std::fs::create_dir_all(&dst_work);
+    for cand in [
+        target_game_dir.join("work").join("work"),
+        target_game_dir.join("work"),
+    ] {
+        if cand.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&cand) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        let dst = dst_work.join(entry.file_name());
+                        if !dst.exists() {
+                            let _ = std::fs::copy(&p, &dst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn targets_only_excluded_game(
+    text_a: &str,
+    text_b: &str,
+    excluded_games: &[String],
+) -> bool {
+    if excluded_games.is_empty() {
+        return false;
+    }
+    let a = text_a.to_ascii_lowercase();
+    let b = text_b.to_ascii_lowercase();
+    for ex in excluded_games {
+        let exl = ex.to_ascii_lowercase();
+        let needle_bs = format!("\\{exl}\\");
+        let needle_fs = format!("/{exl}/");
+        let needle_q = format!("\"{exl}\\");
+        let needle_end = format!("\\{exl}");
+        if a.contains(&needle_bs)
+            || a.contains(&needle_fs)
+            || a.ends_with(&needle_end)
+            || b.contains(&needle_bs)
+            || b.contains(&needle_fs)
+            || b.contains(&needle_q)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_blocked_ifps_exec(exe_lower: &str, params_lower: &str) -> bool {
+    exe_lower.starts_with("http")
+        || exe_lower.contains("quicksfv")
+        || exe_lower.contains("vcredist")
+        || exe_lower.contains("vc_redist")
+        || exe_lower.contains("dxwebsetup")
+        || exe_lower.contains("dxsetup")
+        || exe_lower.contains("dotnet")
+        || exe_lower.contains("unins")
+        || exe_lower.contains("flushfilecache")
+        || params_lower.contains("check.bat")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_ifps_post_unpack(
+    actions: &[IfpsAction],
+    work_dir: &Path,
+    target_game_dir: &Path,
+    fast_temp_dir: &Path,
+    source_root: &Path,
+    excluded_games: &[String],
+    default_password: Option<&str>,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    control: Option<&Arc<PipelineControl>>,
+) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    mirror_work_tools_into_tmp(target_game_dir, work_dir);
+
+    let unarc = embedded_tools::resolve_tool("unarc.exe");
+    let dummy_ctrl = Arc::new(PipelineControl::default());
+    let ctrl_ref = control.unwrap_or(&dummy_ctrl);
+    let clock = Instant::now();
+
+    let orig_path = std::env::var("PATH").unwrap_or_default();
+    let combined_path = format!(
+        "{};{};{};{}",
+        work_dir.display(),
+        work_dir.join("work").display(),
+        embedded_tools::bin_dir().display(),
+        orig_path
+    );
+
+    // Filter down to actionable post-unpack steps (skipping `{src}\*.bin` archives already extracted)
+    let mut runnable = Vec::new();
+    for act in actions {
+        match act {
+            IfpsAction::ArcExtract { archive, .. } => {
+                let low = archive.trim().to_ascii_lowercase();
+                if low.starts_with("{src}") || low.ends_with(".bin") {
+                    continue;
+                }
+                runnable.push(act);
+            }
+            IfpsAction::Exec { exe, params, target_dir, .. } => {
+                let el = exe.to_ascii_lowercase();
+                let pl = params.to_ascii_lowercase();
+                if is_blocked_ifps_exec(&el, &pl) {
+                    continue;
+                }
+                if targets_only_excluded_game(target_dir, params, excluded_games) {
+                    continue;
+                }
+                runnable.push(act);
+            }
+        }
+    }
+
+    let total = runnable.len();
+    if total == 0 {
+        return Ok(());
+    }
+    push_log(
+        shared,
+        format!("[IFPS] Executing {total} post-unpack reconstruction step(s)..."),
+    );
+
+    for (idx, act) in runnable.iter().enumerate() {
+        if let Some(ctrl) = control {
+            if ctrl.cancel_requested.load(Ordering::Relaxed) {
+                anyhow::bail!("Cancelled by user");
+            }
+        }
+        let step_pct = 0.94 + (idx as f32 / total as f32) * 0.04;
+
+        match act {
+            IfpsAction::ArcExtract {
+                archive,
+                out_dir,
+                delete_after,
+                password,
+            } => {
+                let arc_str = dissect::expand_inno_tokens_with_src(
+                    archive.trim(),
+                    target_game_dir,
+                    work_dir,
+                    source_root,
+                );
+                let arc_path = PathBuf::from(&arc_str);
+                if !arc_path.is_file() {
+                    continue;
+                }
+                let out_str = if out_dir.trim().is_empty() {
+                    target_game_dir.display().to_string()
+                } else {
+                    dissect::expand_inno_tokens_with_src(
+                        out_dir.trim(),
+                        target_game_dir,
+                        work_dir,
+                        source_root,
+                    )
+                };
+                let out_path = PathBuf::from(&out_str);
+                let _ = std::fs::create_dir_all(&out_path);
+                let fname = arc_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| arc_str.clone());
+                let pwd = if !password.trim().is_empty() {
+                    Some(password.as_str())
+                } else {
+                    default_password
+                };
+
+                set_progress(
+                    shared,
+                    None,
+                    Some(step_pct),
+                    Some(&format!("Rebuilding ({}/{total}): unpacking {fname}", idx + 1)),
+                );
+                push_log(
+                    shared,
+                    format!("[IFPS-ARC {}/{total}] Unpacking {} -> {}", idx + 1, fname, out_path.display()),
+                );
+                match run_unarc_extract(
+                    &unarc,
+                    work_dir,
+                    &arc_path,
+                    &out_path,
+                    fast_temp_dir,
+                    &[],
+                    pwd,
+                    shared,
+                    ctrl_ref,
+                    clock,
+                    step_pct,
+                    step_pct + 0.001,
+                    &fname,
+                ) {
+                    Ok(()) => {
+                        if *delete_after {
+                            let _ = std::fs::remove_file(&arc_path);
+                        }
+                    }
+                    Err(e) => {
+                        push_log(shared, format!("[WARN] Nested pack {fname} failed: {e}"));
+                    }
+                }
+            }
+            IfpsAction::Exec {
+                exe,
+                params,
+                target_dir,
+                desc,
+            } => {
+                let exe_exp = dissect::expand_inno_tokens_with_src(
+                    exe.trim(),
+                    target_game_dir,
+                    work_dir,
+                    source_root,
+                );
+                let params_exp = dissect::expand_inno_tokens_with_src(
+                    params.trim(),
+                    target_game_dir,
+                    work_dir,
+                    source_root,
+                );
+                let cwd_str = if target_dir.trim().is_empty() {
+                    target_game_dir.display().to_string()
+                } else {
+                    dissect::expand_inno_tokens_with_src(
+                        target_dir.trim(),
+                        target_game_dir,
+                        work_dir,
+                        source_root,
+                    )
+                };
+                let cwd_path = PathBuf::from(cwd_str.trim().trim_end_matches('\\'));
+                let effective_cwd = if cwd_path.is_dir() {
+                    cwd_path
+                } else {
+                    target_game_dir.to_path_buf()
+                };
+
+                // Build exact shell command line matching ISDone's ISExec (`cmd.exe /c ...`)
+                let exe_low = exe_exp.to_ascii_lowercase();
+                let is_cmd_shell = exe_low == "cmd"
+                    || exe_low == "cmd.exe"
+                    || exe_low.ends_with("\\cmd.exe");
+
+                let full_cmdline = if is_cmd_shell {
+                    let trimmed = params_exp.trim();
+                    let stripped = trimmed
+                        .strip_prefix("/c ")
+                        .or_else(|| trimmed.strip_prefix("/C "))
+                        .unwrap_or(trimmed);
+                    stripped.to_string()
+                } else {
+                    // Verify external helper exists if it's an absolute path
+                    let ep = Path::new(&exe_exp);
+                    if ep.is_absolute() && !ep.exists() {
+                        continue;
+                    }
+                    if params_exp.is_empty() {
+                        format!("\"{exe_exp}\"")
+                    } else {
+                        format!("\"{exe_exp}\" {params_exp}")
+                    }
+                };
+
+                let label = if !desc.trim().is_empty() {
+                    desc.trim().to_string()
+                } else {
+                    Path::new(&exe_exp)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "rebuild".into())
+                };
+                set_progress(
+                    shared,
+                    None,
+                    Some(step_pct),
+                    Some(&format!("Rebuilding ({}/{total}): {label}", idx + 1)),
+                );
+                push_log(
+                    shared,
+                    format!("[IFPS-EXEC {}/{total}] ({})> {}", idx + 1, effective_cwd.display(), full_cmdline),
+                );
+
+                // Wrap full_cmdline in outer quotes for `cmd.exe /c "..."` so quoted exe + quoted args + `&&` work reliably
+                let wrapped = format!("/c \"{full_cmdline}\"");
+                let mut cmd = Command::new("cmd.exe");
+                cmd.raw_arg(&wrapped)
+                    .current_dir(&effective_cwd)
+                    .env("PATH", &combined_path)
+                    .env("TEMP", fast_temp_dir)
+                    .env("TMP", fast_temp_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(0x0000_8000 | 0x0800_0000);
+
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        if let Some(ctrl) = control {
+                            attach_job(&child, ctrl);
+                        }
+                        // Drain stdout & stderr without flooding logs with thousands of repetitive PNG lines
+                        let err_h = child.stderr.take().map(|se| {
+                            let sh = shared.clone();
+                            std::thread::spawn(move || {
+                                let mut shown = 0usize;
+                                for line in BufReader::new(se).lines().flatten() {
+                                    let t = line.trim();
+                                    if !t.is_empty() && shown < 12 {
+                                        push_log(&sh, format!("  | [err] {t}"));
+                                        shown += 1;
+                                    }
+                                }
+                            })
+                        });
+                        if let Some(so) = child.stdout.take() {
+                            let mut shown = 0usize;
+                            for line in BufReader::new(so).lines().flatten() {
+                                let t = line.trim();
+                                if !t.is_empty() && shown < 12 {
+                                    push_log(shared, format!("  | {t}"));
+                                    shown += 1;
+                                }
+                            }
+                        }
+                        if let Some(h) = err_h {
+                            let _ = h.join();
+                        }
+                        let _ = child.wait();
+                    }
+                    Err(e) => {
+                        push_log(shared, format!("[WARN] Failed to run step {}: {e}", idx + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up temporary work\ and temp-fitgirl\ directories after IFPS post-unpack finishes
+    for tmp_sub in ["work", "temp-fitgirl"] {
+        let p = target_game_dir.join(tmp_sub);
+        if p.is_dir() && manifest::force_remove_dir_all(&p).is_ok() {
+            push_log(shared, format!("[CLEANUP] Removed post-unpack {tmp_sub}\\ folder."));
+        }
+    }
+
+    Ok(())
 }

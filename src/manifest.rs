@@ -78,7 +78,7 @@ pub fn diff_new_top_dirs(root: &Path, before: &HashSet<String>, excluded: &[Stri
                 continue;
             }
             let name_l = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if name_l == "work" {
+            if name_l == "_arcsteam_gog_stage" {
                 continue;
             }
             let is_excl = excluded.iter().any(|e| e.to_ascii_lowercase() == name_l);
@@ -367,6 +367,28 @@ fn is_safe_reg_delete_key(key: &str) -> bool {
 /// whose TargetPath points inside any of the uninstalled `game_dirs`, removes those `.lnk` files
 /// (even if created by an earlier install or outside the manifest), prunes empty Start Menu folders,
 /// and notifies Windows Shell to refresh Start Menu & Desktop icons immediately.
+
+/// Clears Read-Only attributes recursively across a directory tree before removing it,
+/// preventing `Access is denied. (os error 5)` on games that ship read-only assets.
+pub fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if fs::remove_dir_all(dir).is_ok() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(dir).into_iter().flatten() {
+        if let Ok(meta) = entry.metadata() {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(entry.path(), perms);
+            }
+        }
+    }
+    fs::remove_dir_all(dir)
+}
+
 fn sweep_shortcuts_targeting_dirs(game_dirs: &[PathBuf]) -> Vec<String> {
     let mut removed = Vec::new();
     let prefixes: Vec<String> = game_dirs
@@ -452,7 +474,7 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
             continue;
         }
         if is_safe_delete_dir(dir) {
-            match fs::remove_dir_all(dir) {
+            match force_remove_dir_all(dir) {
                 Ok(()) => logs.push(format!("[UNINSTALL] Deleted game folder: {}", dir.display())),
                 Err(e) => logs.push(format!(
                     "[WARN] Partial delete on {} ({e}) — close game processes if running.",
@@ -470,6 +492,13 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
     // 1b. Delete loose top-level files placed in the install root (e.g. .reg, .bat, .fgpack.x5)
     for f in &m.extra_files {
         if f.is_file() {
+            if let Ok(meta) = fs::metadata(f) {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(f, perms);
+                }
+            }
             if fs::remove_file(f).is_ok() {
                 logs.push(format!("[UNINSTALL] Deleted extra install file: {}", f.display()));
             }
@@ -486,7 +515,7 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
     }
     if let Some(ref sm) = m.start_menu_dir {
         if sm.exists() && is_safe_delete_dir(sm) {
-            if fs::remove_dir_all(sm).is_ok() {
+            if force_remove_dir_all(sm).is_ok() {
                 logs.push(format!("[UNINSTALL] Removed Start Menu folder: {}", sm.display()));
             }
         }
@@ -504,7 +533,7 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
         let profiles = discover_related_profile_dirs(m);
         for pdir in profiles {
             if pdir.exists() && is_safe_delete_dir(&pdir) {
-                if fs::remove_dir_all(&pdir).is_ok() {
+                if force_remove_dir_all(&pdir).is_ok() {
                     logs.push(format!(
                         "[UNINSTALL] Deleted profile/saves folder: {}",
                         pdir.display()

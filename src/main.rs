@@ -4,6 +4,7 @@ mod config;
 mod detect;
 mod dissect;
 mod embedded_tools;
+mod ifps;
 mod manifest;
 mod optimizer;
 mod pipeline;
@@ -1478,25 +1479,7 @@ impl eframe::App for ArcSteamApp {
                                                                     .inner_margin(Margin::same(12))
                                                                     .show(ui, |ui| {
                                                                         ui.horizontal(|ui| {
-                                                                            ui.vertical(|ui| {
-                                                                                ui.label(Self::semibold(&m.display_name, 14.0, TEXT_PRIMARY));
-                                                                                let path_preview = m
-                                                                                    .game_dirs
-                                                                                    .iter()
-                                                                                    .map(|p| p.display().to_string())
-                                                                                    .collect::<Vec<_>>()
-                                                                                    .join("  |  ");
-                                                                                ui.label(
-                                                                                    RichText::new(format!(
-                                                                                        "{}  •  {} shortcut(s)  •  {} reg key(s)",
-                                                                                        path_preview,
-                                                                                        m.shortcuts.len(),
-                                                                                        m.registry_keys.len()
-                                                                                    ))
-                                                                                    .size(11.2)
-                                                                                    .color(TEXT_SECONDARY),
-                                                                                );
-                                                                            });
+                                                                            ui.label(Self::semibold(&m.display_name, 14.0, TEXT_PRIMARY));
                                                                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                                                 if !is_confirming {
                                                                                     if ui
@@ -1517,6 +1500,27 @@ impl eframe::App for ArcSteamApp {
                                                                                 }
                                                                             });
                                                                         });
+                                                                        ui.add_space(3.0);
+                                                                        let clean_dirs: Vec<String> = m
+                                                                            .game_dirs
+                                                                            .iter()
+                                                                            .filter(|p| {
+                                                                                p.file_name()
+                                                                                    .map(|n| n.to_string_lossy() != "_arcsteam_gog_stage")
+                                                                                    .unwrap_or(true)
+                                                                            })
+                                                                            .map(|p| p.display().to_string())
+                                                                            .collect();
+                                                                        ui.label(
+                                                                            RichText::new(format!(
+                                                                                "{}  •  {} shortcut(s)  •  {} reg key(s)",
+                                                                                clean_dirs.join("  |  "),
+                                                                                m.shortcuts.len(),
+                                                                                m.registry_keys.len()
+                                                                            ))
+                                                                            .size(11.2)
+                                                                            .color(TEXT_SECONDARY),
+                                                                        );
 
                                                                         if is_confirming {
                                                                             ui.add_space(8.0);

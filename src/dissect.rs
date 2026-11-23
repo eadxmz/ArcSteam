@@ -32,6 +32,7 @@ pub struct RegistryEntry {
 pub struct IconEntry {
     pub name: String,
     pub filename: String,
+    pub parameters: String,
     pub working_dir: String,
 }
 
@@ -92,6 +93,22 @@ pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> 
     out
 }
 
+
+pub fn expand_inno_tokens_with_src(
+    raw: &str,
+    target_app_dir: &Path,
+    work_dir: &Path,
+    source_root: &Path,
+) -> String {
+    let base = expand_inno_tokens(raw, target_app_dir, work_dir);
+    let src_str = source_root
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+    base.replace("{src}", &src_str).replace("{SRC}", &src_str)
+}
+
 pub fn dissect_inno_setup(
     innounp_exe: &Path,
     setup_exe: &Path,
@@ -102,6 +119,7 @@ pub fn dissect_inno_setup(
     let out = Command::new(innounp_exe)
         .args([
             "-x",
+            "-m",
             "-y",
             &format!("-d{}", work_dir.display()),
             &setup_exe.display().to_string(),
@@ -150,6 +168,17 @@ pub fn dissect_inno_setup(
                 name_os
             };
             let _ = fs::copy(src, work_dir.join(dst_name));
+            // Also preserve relative subpath inside `{tmp}\...` (e.g., `{tmp}\_Redist\builder.exe` -> `work_dir\_Redist\builder.exe`)
+            let tmp_root = work_dir.join("{tmp}");
+            if let Ok(rel_tmp) = src.strip_prefix(&tmp_root) {
+                if rel_tmp.components().count() > 1 {
+                    let sub_dst = work_dir.join(rel_tmp);
+                    if let Some(p) = sub_dst.parent() {
+                        let _ = fs::create_dir_all(p);
+                    }
+                    let _ = fs::copy(src, &sub_dst);
+                }
+            }
         }
     }
 
@@ -385,6 +414,7 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
         } else if section.eq_ignore_ascii_case("[Icons]") {
             let mut name = String::new();
             let mut filename = String::new();
+            let mut parameters = String::new();
             let mut working_dir = String::new();
             for cap in re_kv.captures_iter(line) {
                 let k = cap[1].to_ascii_lowercase();
@@ -396,6 +426,7 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
                 match k.as_str() {
                     "name" => name = v,
                     "filename" => filename = v,
+                    "parameters" => parameters = v,
                     "workingdir" => working_dir = v,
                     _ => {}
                 }
@@ -410,6 +441,7 @@ fn parse_install_script(script: &str, out: &mut DissectedSetup) {
                 out.icon_entries.push(IconEntry {
                     name,
                     filename,
+                    parameters,
                     working_dir,
                 });
             }
@@ -498,10 +530,11 @@ pub fn apply_registry_entries(
         for &view in reg_views {
             let mut cmd = Command::new("reg");
             cmd.args(["add", &key_path, "/t", reg_type, "/d", &data, "/f", view]);
-            if e.value_name.is_empty() {
+            let vname = expand_inno_tokens(&e.value_name, target_app_dir, work_dir);
+            if vname.is_empty() {
                 cmd.arg("/ve");
             } else {
-                cmd.args(["/v", &e.value_name]);
+                cmd.args(["/v", &vname]);
             }
             if cmd
                 .creation_flags(CREATE_NO_WINDOW)
@@ -604,8 +637,10 @@ pub fn create_desktop_shortcuts(
         } else {
             icon.working_dir.replace("{app}", &app_str)
         };
+        let params = icon.parameters.replace("{app}", &app_str);
+        let params_opt = if params.trim().is_empty() { None } else { Some(params.as_str()) };
         let lnk = desktop.join(format!("{clean_name}.lnk"));
-        if create_lnk_shortcut(&lnk, &exe_path, None, &work_dir) {
+        if create_lnk_shortcut(&lnk, &exe_path, params_opt, &work_dir) {
             created.push(lnk);
         }
     }
@@ -662,8 +697,10 @@ pub fn create_start_menu_shortcuts(
         } else {
             icon.working_dir.replace("{app}", &app_str)
         };
+        let params = icon.parameters.replace("{app}", &app_str);
+        let params_opt = if params.trim().is_empty() { None } else { Some(params.as_str()) };
         let lnk = sm_dir.join(format!("{clean_name}.lnk"));
-        if create_lnk_shortcut(&lnk, &exe_path, None, &work_dir) {
+        if create_lnk_shortcut(&lnk, &exe_path, params_opt, &work_dir) {
             created.push(lnk);
         }
     }
