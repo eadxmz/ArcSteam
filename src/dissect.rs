@@ -965,8 +965,8 @@ pub fn patch_post_unpack_scripts(
         let best_idx = scores
             .iter()
             .enumerate()
-            .max_by_key(|(_, &sc)| sc)
-            .filter(|(_, &sc)| sc > 0)
+            .max_by_key(|&(_, &sc)| sc)
+            .filter(|&(_, &sc)| sc > 0)
             .map(|(i, _)| i);
 
         let chosen = if let Some(idx) = best_idx {
