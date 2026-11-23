@@ -1105,3 +1105,93 @@ pub fn find_primary_game_exe(game_dir: &Path) -> Option<PathBuf> {
     }
     best.map(|(_, p)| p)
 }
+
+
+/// Lists top-level directories and loose files that exist inside `work_dir\{app}`
+/// so Uninstall tracks auxiliary setup folders (`_Redist`, `DLC Unlocker`, etc.) and loose root files
+/// even when reinstalling over an existing install directory.
+pub fn list_embedded_app_entries(
+    work_dir: &Path,
+    target_app_dir: &Path,
+    excluded_games: &[String],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let app_src = work_dir.join("{app}");
+    if !app_src.is_dir() {
+        return (dirs, files);
+    }
+    if let Ok(rd) = fs::read_dir(&app_src) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let nl = name.to_string_lossy().to_ascii_lowercase();
+            if nl == "work"
+                || nl.starts_with("unins")
+                || nl.ends_with(".url")
+                || nl == "quicksfv.exe"
+                || nl == "quicksfv.ini"
+            {
+                continue;
+            }
+            if excluded_games.iter().any(|e| e.to_ascii_lowercase() == nl) {
+                continue;
+            }
+            let dst = target_app_dir.join(&name);
+            if entry.path().is_dir() && dst.is_dir() {
+                dirs.push(dst);
+            } else if entry.path().is_file() && dst.is_file() {
+                files.push(dst);
+            }
+        }
+    }
+    (dirs, files)
+}
+
+/// Logs a concise diagnostic preview of `bat_path`, companion `fitgirl*.txt` job files, and tools in `bat_dir`.
+pub fn inspect_builder_diagnostics(bat_path: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(bat_dir) = bat_path.parent() else {
+        return lines;
+    };
+    if let Ok(rd) = fs::read_dir(bat_dir) {
+        let mut tools: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                let nl = n.to_ascii_lowercase();
+                if nl.ends_with(".exe") || nl.ends_with(".bat") || nl.ends_with(".txt") {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        tools.sort();
+        if !tools.is_empty() {
+            lines.push(format!("[REBUILD] Tools in {}: {}", bat_dir.display(), tools.join(", ")));
+        }
+    }
+    if let Ok(bytes) = fs::read(bat_path) {
+        let text = String::from_utf8_lossy(&bytes);
+        for (idx, l) in text.lines().filter(|l| !l.trim().is_empty()).take(5).enumerate() {
+            lines.push(format!("[REBUILD] bat[{}]: {}", idx + 1, l.trim()));
+        }
+    }
+    // Preview first 5 lines of any fitgirl*.txt job list in bat_dir
+    if let Ok(rd) = fs::read_dir(bat_dir) {
+        for entry in rd.flatten() {
+            let nl = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if nl.starts_with("fitgirl") && nl.ends_with(".txt") {
+                if let Ok(bytes) = fs::read(entry.path()) {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let total = text.lines().filter(|l| !l.trim().is_empty()).count();
+                    lines.push(format!("[REBUILD] {} ({total} job lines):", entry.file_name().to_string_lossy()));
+                    for (idx, l) in text.lines().filter(|l| !l.trim().is_empty()).take(4).enumerate() {
+                        lines.push(format!("[REBUILD]   job[{}]: {}", idx + 1, l.trim()));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}

@@ -80,12 +80,9 @@ impl AppConfig {
             };
             let val = v.trim();
             match k.trim() {
-                "local_source" if !val.is_empty() => {
-                    if val.to_ascii_lowercase().contains("after neet") {
-                        migrated = true;
-                    } else {
-                        cfg.local_source = PathBuf::from(val);
-                    }
+                "local_source" | "start_menu_folder" | "create_shortcuts" => {
+                    // Per-install fields: keep Repack Folder & Start Menu Folder blank on launch
+                    // (auto-filled when a repack is selected) and keep Desktop Icon checked by default.
                 }
                 "download_cache_dir" if !val.is_empty() => {
                     if val.eq_ignore_ascii_case(r"G:\ArcSteamCache") {
@@ -100,9 +97,7 @@ impl AppConfig {
                 "live_install_while_dl" => cfg.live_install_while_dl = val == "true",
                 "defender_bypass" => cfg.defender_bypass = val == "true",
                 "replay_registry" => cfg.replay_registry = val == "true",
-                "create_shortcuts" => cfg.create_shortcuts = val == "true",
                 "create_start_menu" => cfg.create_start_menu = val == "true",
-                "start_menu_folder" => cfg.start_menu_folder = val.to_string(),
                 "auto_clean_temp" => cfg.auto_clean_temp = val == "true",
                 "auto_ram" => cfg.auto_ram = val == "true",
                 "srep_ram_mb" => {
@@ -122,8 +117,7 @@ impl AppConfig {
 
     pub fn save(&self) {
         let data = format!(
-            "local_source={}\ndownload_cache_dir={}\ntemp_ssd_dir={}\ntarget_game_dir={}\nvirtual_drive={}\nlive_install_while_dl={}\ndefender_bypass={}\nreplay_registry={}\ncreate_shortcuts={}\ncreate_start_menu={}\nstart_menu_folder={}\nauto_clean_temp={}\nauto_ram={}\nsrep_ram_mb={}\npost_queue_action={}\n",
-            self.local_source.display(),
+            "download_cache_dir={}\ntemp_ssd_dir={}\ntarget_game_dir={}\nvirtual_drive={}\nlive_install_while_dl={}\ndefender_bypass={}\nreplay_registry={}\ncreate_start_menu={}\nauto_clean_temp={}\nauto_ram={}\nsrep_ram_mb={}\npost_queue_action={}\n",
             self.download_cache_dir.display(),
             self.temp_ssd_dir.display(),
             self.target_game_dir.display(),
@@ -131,9 +125,7 @@ impl AppConfig {
             self.live_install_while_dl,
             self.defender_bypass,
             self.replay_registry,
-            self.create_shortcuts,
             self.create_start_menu,
-            self.start_menu_folder,
             self.auto_clean_temp,
             self.auto_ram,
             self.srep_ram_mb,

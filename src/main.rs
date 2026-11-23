@@ -706,6 +706,9 @@ impl eframe::App for ArcSteamApp {
             } else if path.extension().and_then(|e| e.to_str()) == Some("torrent") {
                 self.tab = MainTab::Install;
                 self.source_kind = SourceKind::TorrentMagnet;
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    self.cfg.start_menu_folder = stem.to_string();
+                }
                 self.magnet_or_torrent = path.display().to_string();
             }
         }
@@ -1096,6 +1099,9 @@ impl eframe::App for ArcSteamApp {
                                                                         .add_filter("BitTorrent", &["torrent"])
                                                                         .pick_file()
                                                                     {
+                                                                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                                                                            self.cfg.start_menu_folder = stem.to_string();
+                                                                        }
                                                                         self.magnet_or_torrent = p.display().to_string();
                                                                     }
                                                                 }
@@ -1142,7 +1148,7 @@ impl eframe::App for ArcSteamApp {
                                                                 .add_enabled(
                                                                     self.cfg.create_start_menu,
                                                                     egui::TextEdit::singleline(&mut self.cfg.start_menu_folder)
-                                                                        .hint_text("Auto (Game Name)")
+                                                                        .hint_text("Auto-filled when repack is selected")
                                                                         .margin(Margin::symmetric(10, 6))
                                                                         .desired_width(sm_w),
                                                                 )

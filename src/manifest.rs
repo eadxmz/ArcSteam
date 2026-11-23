@@ -21,6 +21,7 @@ pub struct InstallManifest {
     pub display_name: String,
     pub install_root: PathBuf,
     pub game_dirs: Vec<PathBuf>,
+    pub extra_files: Vec<PathBuf>,
     pub start_menu_dir: Option<PathBuf>,
     pub shortcuts: Vec<PathBuf>,
     pub profile_dirs: Vec<PathBuf>,
@@ -77,11 +78,42 @@ pub fn diff_new_top_dirs(root: &Path, before: &HashSet<String>, excluded: &[Stri
                 continue;
             }
             let name_l = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if name_l == "work" || name_l == "_redist" {
+            if name_l == "work" {
                 continue;
             }
             let is_excl = excluded.iter().any(|e| e.to_ascii_lowercase() == name_l);
             if !is_excl && !before.contains(&name_l) {
+                added.push(p);
+            }
+        }
+    }
+    added.sort();
+    added
+}
+
+
+pub fn snapshot_top_files(root: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for entry in rd.flatten() {
+            if entry.path().is_file() {
+                set.insert(entry.file_name().to_string_lossy().to_ascii_lowercase());
+            }
+        }
+    }
+    set
+}
+
+pub fn diff_new_top_files(root: &Path, before: &HashSet<String>) -> Vec<PathBuf> {
+    let mut added = Vec::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name_l = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !before.contains(&name_l) {
                 added.push(p);
             }
         }
@@ -220,6 +252,9 @@ pub fn save_manifest(m: &InstallManifest) -> std::io::Result<PathBuf> {
     for d in &m.game_dirs {
         out.push_str(&format!("game_dir={}\n", d.display()));
     }
+    for f in &m.extra_files {
+        out.push_str(&format!("extra_file={}\n", f.display()));
+    }
     for s in &m.shortcuts {
         out.push_str(&format!("shortcut={}\n", s.display()));
     }
@@ -265,6 +300,7 @@ pub fn load_all_manifests() -> Vec<InstallManifest> {
                 "uninstall_reg_key" => m.uninstall_reg_key = val.to_string(),
                 "start_menu_dir" => m.start_menu_dir = Some(PathBuf::from(val)),
                 "game_dir" => m.game_dirs.push(PathBuf::from(val)),
+                "extra_file" => m.extra_files.push(PathBuf::from(val)),
                 "shortcut" => m.shortcuts.push(PathBuf::from(val)),
                 "profile_dir" => m.profile_dirs.push(PathBuf::from(val)),
                 "reg_key" => m.registry_keys.push(val.to_string()),
@@ -428,6 +464,15 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
                 "[WARN] Safety guard protected shared root folder: {} (only game subfolders are deleted).",
                 dir.display()
             ));
+        }
+    }
+
+    // 1b. Delete loose top-level files placed in the install root (e.g. .reg, .bat, .fgpack.x5)
+    for f in &m.extra_files {
+        if f.is_file() {
+            if fs::remove_file(f).is_ok() {
+                logs.push(format!("[UNINSTALL] Deleted extra install file: {}", f.display()));
+            }
         }
     }
 

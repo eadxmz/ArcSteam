@@ -127,8 +127,8 @@ pub struct SharedTelemetry {
 impl SharedTelemetry {
     pub fn log(&mut self, msg: impl Into<String>) {
         self.logs.push(msg.into());
-        if self.logs.len() > 600 {
-            self.logs.drain(0..150);
+        if self.logs.len() > 2000 {
+            self.logs.drain(0..400);
         }
     }
 }
@@ -485,6 +485,7 @@ pub fn run_local_turbo_pipeline(
     // Snapshot existing directories inside target_game_dir BEFORE extraction so the uninstaller
     // knows the exact game folder(s) created by this install (never deleting sibling games!).
     let dirs_before = manifest::snapshot_top_dirs(&cfg.target_game_dir);
+    let files_before = manifest::snapshot_top_files(&cfg.target_game_dir);
 
     let work_dir = cfg.fast_temp_dir.join("arcsteam_work");
     if work_dir.exists() {
@@ -592,6 +593,7 @@ pub fn run_local_turbo_pipeline(
                     &work_dir,
                     cfg,
                     &dirs_before,
+                    &files_before,
                     shared,
                     Some(control),
                 )?;
@@ -933,6 +935,7 @@ pub fn run_local_turbo_pipeline(
         &work_dir,
         cfg,
         &dirs_before,
+        &files_before,
         shared,
         Some(control),
     )?;
@@ -968,6 +971,7 @@ pub fn spawn_repair_existing_thread(
             std::fs::create_dir_all(&work_dir)?;
 
             let empty_before = HashSet::new();
+            let empty_files_before = HashSet::new();
             let dissected = if let Some(setup) = setup_exe {
                 if innounp.exists() {
                     push_log(&shared, format!("[REPAIR] Dissecting {}", setup.display()));
@@ -985,6 +989,7 @@ pub fn spawn_repair_existing_thread(
                 &work_dir,
                 &cfg,
                 &empty_before,
+                &empty_files_before,
                 &shared,
                 None,
             )?;
@@ -1027,6 +1032,7 @@ fn finalize_setup_metadata(
     work_dir: &Path,
     cfg: &JobConfig,
     dirs_before: &HashSet<String>,
+    files_before: &HashSet<String>,
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: Option<&Arc<PipelineControl>>,
 ) -> Result<()> {
@@ -1061,6 +1067,9 @@ fn finalize_setup_metadata(
             for note in dissect::patch_post_unpack_scripts(bat_path, target_game_dir, work_dir) {
                 push_log(shared, note);
             }
+            for diag in dissect::inspect_builder_diagnostics(bat_path) {
+                push_log(shared, diag);
+            }
             push_log(
                 shared,
                 format!("[REBUILD] Executing post-unpack builder: {}", bat_path.display()),
@@ -1081,22 +1090,20 @@ fn finalize_setup_metadata(
             }
         }
 
+        // Check for any leftover *.fgpack.x5 packs; if they are nested FreeArc/7z archives, unpack them automatically!
+        let leftover_fgpacks = process_leftover_fgpacks(
+            target_game_dir,
+            work_dir,
+            fast_temp_dir,
+            dissected.archive_password.as_deref(),
+            shared,
+            control,
+        );
         if ran_work_builder {
-            let leftover_fgpack = std::fs::read_dir(target_game_dir)
-                .ok()
-                .map(|rd| {
-                    rd.flatten().any(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .ends_with(".fgpack.x5")
-                    })
-                })
-                .unwrap_or(false);
-            if leftover_fgpack {
+            if leftover_fgpacks > 0 {
                 push_log(
                     shared,
-                    "[WARN] .fgpack.x5 pack still present after build01.bat — keeping work\\ folder so you can inspect or re-run.",
+                    format!("[WARN] {leftover_fgpacks} .fgpack.x5 pack(s) still unconsumed — keeping work\\ folder for inspection."),
                 );
             } else {
                 let game_work = target_game_dir.join("work");
@@ -1240,6 +1247,26 @@ fn finalize_setup_metadata(
             owned_game_dirs.push(icon_dir);
         }
     }
+    let (emb_dirs, emb_files) =
+        dissect::list_embedded_app_entries(work_dir, target_game_dir, excluded_games);
+    for ed in emb_dirs {
+        let key = ed.display().to_string().to_ascii_lowercase();
+        if seen_owned.insert(key) {
+            owned_game_dirs.push(ed);
+        }
+    }
+
+    let mut owned_extra_files = manifest::diff_new_top_files(target_game_dir, files_before);
+    let mut seen_files: HashSet<String> = owned_extra_files
+        .iter()
+        .map(|p| p.display().to_string().to_ascii_lowercase())
+        .collect();
+    for ef in emb_files {
+        let key = ef.display().to_string().to_ascii_lowercase();
+        if seen_files.insert(key) {
+            owned_extra_files.push(ef);
+        }
+    }
 
     if owned_game_dirs.is_empty() {
         owned_game_dirs.push(target_game_dir.to_path_buf());
@@ -1253,6 +1280,7 @@ fn finalize_setup_metadata(
         display_name: cfg.display_name.clone(),
         install_root: target_game_dir.to_path_buf(),
         game_dirs: owned_game_dirs,
+        extra_files: owned_extra_files,
         start_menu_dir: tracked_start_menu,
         shortcuts: tracked_shortcuts,
         profile_dirs: tracked_profiles,
@@ -1785,4 +1813,109 @@ fn run_and_stream_logs(
     }
     set_progress(shared, None, Some(end_p), None);
     Ok(())
+}
+
+fn process_leftover_fgpacks(
+    target_game_dir: &Path,
+    work_dir: &Path,
+    fast_temp_dir: &Path,
+    password: Option<&str>,
+    shared: &Arc<Mutex<SharedTelemetry>>,
+    control: Option<&Arc<PipelineControl>>,
+) -> usize {
+    use std::io::Read;
+    let Ok(rd) = std::fs::read_dir(target_game_dir) else {
+        return 0;
+    };
+    let fgpacks: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().to_ascii_lowercase().ends_with(".fgpack.x5"))
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    if fgpacks.is_empty() {
+        return 0;
+    }
+
+    let unarc = embedded_tools::resolve_tool("unarc.exe");
+    let seven_zip = embedded_tools::resolve_tool("7z.exe");
+    let dummy_ctrl = Arc::new(PipelineControl::default());
+    let ctrl_ref = control.unwrap_or(&dummy_ctrl);
+    let clock = Instant::now();
+    let mut remaining = 0usize;
+
+    for pack in fgpacks {
+        let fname = pack
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let magic = detect::probe_archive_magic(&pack);
+        let sz = std::fs::metadata(&pack).map(|m| m.len()).unwrap_or(0);
+
+        // Log first 12 bytes for exact format diagnostics
+        let mut hdr = [0u8; 12];
+        let hdr_hex = std::fs::File::open(&pack)
+            .ok()
+            .and_then(|mut f| f.read(&mut hdr).ok())
+            .map(|n| {
+                hdr[..n]
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+
+        push_log(
+            shared,
+            format!("[FGPACK] Leftover {fname} ({sz} bytes) | magic={magic:?} | hdr=[{hdr_hex}]"),
+        );
+
+        let unpacked = match magic {
+            ArchiveMagic::FreeArc => run_unarc_extract(
+                &unarc,
+                work_dir,
+                &pack,
+                target_game_dir,
+                fast_temp_dir,
+                &[],
+                password,
+                shared,
+                ctrl_ref,
+                clock,
+                0.96,
+                0.98,
+                &fname,
+            )
+            .is_ok(),
+            ArchiveMagic::SevenZip | ArchiveMagic::Rar | ArchiveMagic::Zip => run_7z_extract(
+                &seven_zip,
+                &pack,
+                target_game_dir,
+                fast_temp_dir,
+                &[],
+                shared,
+                ctrl_ref,
+                clock,
+                0.96,
+                0.98,
+                &fname,
+            )
+            .is_ok(),
+            _ => false,
+        };
+
+        if unpacked {
+            let _ = std::fs::remove_file(&pack);
+            push_log(shared, format!("[FGPACK] Unpacked and removed nested pack {fname}."));
+        } else {
+            remaining += 1;
+        }
+    }
+    remaining
 }
