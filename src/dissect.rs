@@ -813,10 +813,14 @@ pub fn detect_script_cwd_and_args(bat_path: &Path, target_app_dir: &Path) -> (Pa
         .unwrap_or_default();
 
     let needs_app_arg = content.contains("%1") || content.contains("%~1");
+    let in_work_tree = bat_path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("\\work\\");
     let uses_parent_rel = content.contains("..\\") || content.contains("../");
     let uses_work_prefix = content.contains("work\\") || content.contains("work/");
 
-    let cwd = if uses_parent_rel {
+    let cwd = if in_work_tree || uses_parent_rel {
         bat_dir
     } else if uses_work_prefix {
         target_app_dir.to_path_buf()
@@ -1068,4 +1072,36 @@ pub fn infer_game_dirs_from_icons(
         }
     }
     dirs
+}
+
+
+/// Finds the primary game executable inside a newly unpacked folder (ignoring uninstallers,
+/// redistributables, crash reporters, and editor tools) so GOG Pure Inno installs get clean shortcuts.
+pub fn find_primary_game_exe(game_dir: &Path) -> Option<PathBuf> {
+    let skip_tokens = [
+        "unins", "redist", "dxsetup", "vcredist", "crash", "report", "language", "lang",
+        "config", "settings", "updater", "firewall", "editor", "dedicated", "server", "benchmark",
+    ];
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in WalkDir::new(game_dir).max_depth(3).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("exe")) != Some(true) {
+            continue;
+        }
+        let lower = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if skip_tokens.iter().any(|t| lower.contains(t)) {
+            continue;
+        }
+        let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().map(|(bsz, _)| sz > *bsz).unwrap_or(true) {
+            best = Some((sz, p.to_path_buf()));
+        }
+    }
+    best.map(|(_, p)| p)
 }

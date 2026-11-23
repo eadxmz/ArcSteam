@@ -520,16 +520,75 @@ pub fn run_local_turbo_pipeline(
             if innoextract.exists() {
                 set_progress(shared, None, Some(0.1), Some("Streaming Pure Inno Setup via innoextract..."));
                 push_log(shared, format!("[INNO] Running headless innoextract on {}", setup.display()));
+                let stage_dir = cfg.target_game_dir.join("_arcsteam_gog_stage");
+                if stage_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&stage_dir);
+                }
+                std::fs::create_dir_all(&stage_dir)?;
+
                 let args = vec![
                     "-e".into(),
                     "-d".into(),
-                    cfg.target_game_dir.display().to_string(),
+                    stage_dir.display().to_string(),
                     setup.display().to_string(),
                 ];
-                run_and_stream_logs(&innoextract, &args, None, &cfg.fast_temp_dir, shared, control, job_start, 0.1, 0.95)?;
-                let empty_dissected = dissect::DissectedSetup::default();
+                let extract_res = run_and_stream_logs(
+                    &innoextract,
+                    &args,
+                    None,
+                    &cfg.fast_temp_dir,
+                    shared,
+                    control,
+                    job_start,
+                    0.1,
+                    0.94,
+                );
+                if let Err(e) = extract_res {
+                    let _ = std::fs::remove_dir_all(&stage_dir);
+                    return Err(e);
+                }
+
+                // Promote `stage_dirpp` into `target_game_dir\<Game Name>`
+                let game_folder_name = cfg
+                    .display_name
+                    .replace([':', '*', '?', '"', '<', '>', '|', '\', '/'], "")
+                    .trim()
+                    .to_string();
+                let clean_name = if game_folder_name.is_empty() {
+                    "GOG Game".to_string()
+                } else {
+                    game_folder_name
+                };
+                let final_game_dir = cfg.target_game_dir.join(&clean_name);
+                let staged_app = stage_dir.join("app");
+                if staged_app.is_dir() {
+                    if final_game_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&final_game_dir);
+                    }
+                    if std::fs::rename(&staged_app, &final_game_dir).is_err() {
+                        std::fs::create_dir_all(&final_game_dir)?;
+                    }
+                    push_log(
+                        shared,
+                        format!("[INNO] Installed game files to {}", final_game_dir.display()),
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&stage_dir);
+
+                let mut gog_dissected = dissect::DissectedSetup::default();
+                if let Some(main_exe) = dissect::find_primary_game_exe(&final_game_dir) {
+                    let rel_exe = main_exe
+                        .strip_prefix(&cfg.target_game_dir)
+                        .unwrap_or(&main_exe);
+                    gog_dissected.icon_entries.push(dissect::IconEntry {
+                        name: clean_name.clone(),
+                        filename: format!("{{app}}\{}", rel_exe.display()),
+                        working_dir: String::new(),
+                    });
+                }
+
                 finalize_setup_metadata(
-                    &empty_dissected,
+                    &gog_dissected,
                     &work_dir,
                     cfg,
                     &dirs_before,
@@ -1023,9 +1082,27 @@ fn finalize_setup_metadata(
         }
 
         if ran_work_builder {
-            let game_work = target_game_dir.join("work");
-            if game_work.is_dir() && std::fs::remove_dir_all(&game_work).is_ok() {
-                push_log(shared, "[CLEANUP] Removed post-unpack work\\ folder.");
+            let leftover_fgpack = std::fs::read_dir(target_game_dir)
+                .ok()
+                .map(|rd| {
+                    rd.flatten().any(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .ends_with(".fgpack.x5")
+                    })
+                })
+                .unwrap_or(false);
+            if leftover_fgpack {
+                push_log(
+                    shared,
+                    "[WARN] .fgpack.x5 pack still present after build01.bat — keeping work\\ folder so you can inspect or re-run.",
+                );
+            } else {
+                let game_work = target_game_dir.join("work");
+                if game_work.is_dir() && std::fs::remove_dir_all(&game_work).is_ok() {
+                    push_log(shared, "[CLEANUP] Removed post-unpack work\\ folder.");
+                }
             }
         }
     }

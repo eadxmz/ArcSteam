@@ -45,7 +45,7 @@ jobs:
           Copy-Item "C:\Program Files\7-Zip\7z.exe" "bundled_tools\7z.exe" -Force
           Copy-Item "C:\Program Files\7-Zip\7z.dll" "bundled_tools\7z.dll" -Force
 
-          # 3. innoextract (Inno Setup up to 6.7.0, with official 1.9 fallback)
+          # 3. innoextract + ALL accompanying runtime DLLs (prevents 0xC0000135 / -1073741515 on user PCs)
           try {
             $rel = Invoke-RestMethod "https://api.github.com/repos/UserUnknownFactor/innoextract_win/releases/latest" -Headers $ghHeaders
             $asset = $rel.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
@@ -56,13 +56,26 @@ jobs:
           Expand-Archive "_dl\innoextract.zip" -DestinationPath "_dl\innoextract" -Force
           $inno = Get-ChildItem "_dl\innoextract" -Recurse -Filter "innoextract.exe" | Select-Object -First 1
           Copy-Item $inno.FullName "bundled_tools\innoextract.exe" -Force
+          Get-ChildItem $inno.DirectoryName -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "bundled_tools\$($_.Name)" -Force
+          }
 
-          # 4. innounp-2 (Inno Setup up to 7.1.1, with v0.50 fallback)
+          # Verify innoextract.exe runs with zero external PATH dependencies
+          $origPath = $env:PATH
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          & "bundled_tools\innoextract.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "bundled_tools\innoextract.exe failed standalone DLL check ($LASTEXITCODE)" }
+          $env:PATH = $origPath
+
+          # 4. innounp-2 + any accompanying DLLs
           try {
             Invoke-WebRequest "https://raw.githubusercontent.com/jrathlev/InnoUnpacker-Windows-GUI/master/innounp-2/innounp-2.zip" -OutFile "_dl\innounp.zip"
             Expand-Archive "_dl\innounp.zip" -DestinationPath "_dl\innounp" -Force
             $iu = Get-ChildItem "_dl\innounp" -Recurse -Filter "innounp*.exe" | Select-Object -First 1
             Copy-Item $iu.FullName "bundled_tools\innounp.exe" -Force
+            Get-ChildItem $iu.DirectoryName -Filter "*.dll" | ForEach-Object {
+              Copy-Item $_.FullName "bundled_tools\$($_.Name)" -Force
+            }
           } catch {
             Invoke-WebRequest "https://github.com/WhatTheBlock/innounp/releases/download/v0.50/innounp.exe" -OutFile "bundled_tools\innounp.exe"
           }
