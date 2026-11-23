@@ -351,7 +351,7 @@ pub fn patch_unpacker_configs(
         text = text.replace("{tmp}", &work_dir.display().to_string());
         let re_mem = Regex::new(r"(?i)-mem\d+m?b?")?;
         text = re_mem.replace_all(&text, format!("-mem{effective_ram_mb}mb")).to_string();
-        let re_threads = Regex::new(r"(?i)-t\d+")?;
+        let re_threads = Regex::new(r"(?i)-t\d+\b")?;
         text = re_threads.replace_all(&text, format!("-t{threads}")).to_string();
         if let Some(ref exe64) = external_srep64 {
             let re_srep_cmd = Regex::new(r"(?i)\bsrep\.exe\b")?;
@@ -384,6 +384,8 @@ pub fn spawn_turbo_process(
 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{};{}", dir.display(), orig_path));
     }
 
     let flags = if show_window {

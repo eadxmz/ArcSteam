@@ -1625,6 +1625,10 @@ fn run_unarc_extract(
             format!("-w{}", fast_temp_dir.display()),
             format!("-dp{}", target_game_dir.display()),
         ];
+        let arc_ini_path = work_dir.join("arc.ini");
+        if arc_ini_path.is_file() {
+            args.push(format!("-cfg{}", arc_ini_path.display()));
+        }
         if let Some(pwd) = password {
             args.push(format!("-p{pwd}"));
         }
@@ -1656,6 +1660,10 @@ fn run_unarc_extract(
         format!("-w{}", fast_temp_dir.display()),
         format!("-dp{}", target_game_dir.display()),
     ];
+    let arc_ini_path = work_dir.join("arc.ini");
+    if arc_ini_path.is_file() {
+        args.push(format!("-cfg{}", arc_ini_path.display()));
+    }
     if let Some(pwd) = password {
         args.push(format!("-p{pwd}"));
     }
@@ -2248,7 +2256,7 @@ fn replay_ifps_post_unpack(
                 );
 
                 // Wrap full_cmdline in outer quotes for `cmd.exe /c "..."` so quoted exe + quoted args + `&&` work reliably
-                let wrapped = format!("/c \"{full_cmdline}\"");
+                let wrapped = format!("/s /c \"{full_cmdline}\"");
                 let mut cmd = Command::new("cmd.exe");
                 cmd.raw_arg(&wrapped)
                     .current_dir(&effective_cwd)
