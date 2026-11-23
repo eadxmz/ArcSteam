@@ -326,6 +326,83 @@ fn is_safe_reg_delete_key(key: &str) -> bool {
 
 /// Executes uninstallation in either `KeepProfile` or `DeleteEverything` mode.
 /// Returns a summary log vector of all actions performed.
+
+/// Sweeps User + Public Desktop and User + All-Users Start Menu for any `.lnk` shortcut
+/// whose TargetPath points inside any of the uninstalled `game_dirs`, removes those `.lnk` files
+/// (even if created by an earlier install or outside the manifest), prunes empty Start Menu folders,
+/// and notifies Windows Shell to refresh Start Menu & Desktop icons immediately.
+fn sweep_shortcuts_targeting_dirs(game_dirs: &[PathBuf]) -> Vec<String> {
+    let mut removed = Vec::new();
+    let prefixes: Vec<String> = game_dirs
+        .iter()
+        .filter(|d| is_safe_delete_dir(d))
+        .map(|d| {
+            let mut s = d.display().to_string().trim_end_matches('\\').to_string();
+            s.push('\\');
+            s.replace('\'', "''")
+        })
+        .collect();
+    if prefixes.is_empty() {
+        return removed;
+    }
+
+    let prefixes_ps = prefixes
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let ps = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'; \
+         $prefixes = @({prefixes_ps}); \
+         $ws = New-Object -ComObject WScript.Shell; \
+         $roots = @( \
+           [Environment]::GetFolderPath('Desktop'), \
+           [Environment]::GetFolderPath('CommonDesktopDirectory'), \
+           (Join-Path ([Environment]::GetFolderPath('Programs')) ''), \
+           (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) '') \
+         ) | Where-Object {{ $_ -and (Test-Path $_) }}; \
+         foreach ($r in $roots) {{ \
+           Get-ChildItem -Path $r -Filter '*.lnk' -Recurse -File | ForEach-Object {{ \
+             $t = $ws.CreateShortcut($_.FullName).TargetPath; \
+             if ($t) {{ \
+               $tl = $t.ToLowerInvariant(); \
+               foreach ($px in $prefixes) {{ \
+                 if ($tl.StartsWith($px.ToLowerInvariant())) {{ \
+                   Remove-Item -LiteralPath $_.FullName -Force; \
+                   Write-Output $_.FullName; \
+                   break; \
+                 }} \
+               }} \
+             }} \
+           }}; \
+         }}; \
+         foreach ($sm in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms'))) {{ \
+           if ($sm -and (Test-Path $sm)) {{ \
+             Get-ChildItem -Path $sm -Directory | ForEach-Object {{ \
+               if ((Get-ChildItem -LiteralPath $_.FullName -Force | Measure-Object).Count -eq 0) {{ \
+                 Remove-Item -LiteralPath $_.FullName -Force; \
+               }} \
+             }}; \
+           }} \
+         }}"
+    );
+
+    if let Ok(out) = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                removed.push(trimmed.to_string());
+            }
+        }
+    }
+    removed
+}
+
 pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String> {
     let mut logs = Vec::new();
     logs.push(format!(
@@ -335,7 +412,10 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
 
     // 1. Delete game install directories (strictly safety-checked!)
     for dir in &m.game_dirs {
-        if dir.exists() && is_safe_delete_dir(dir) {
+        if !dir.exists() {
+            continue;
+        }
+        if is_safe_delete_dir(dir) {
             match fs::remove_dir_all(dir) {
                 Ok(()) => logs.push(format!("[UNINSTALL] Deleted game folder: {}", dir.display())),
                 Err(e) => logs.push(format!(
@@ -343,6 +423,11 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
                     dir.display()
                 )),
             }
+        } else {
+            logs.push(format!(
+                "[WARN] Safety guard protected shared root folder: {} (only game subfolders are deleted).",
+                dir.display()
+            ));
         }
     }
 
@@ -361,6 +446,13 @@ pub fn execute_uninstall(m: &InstallManifest, mode: UninstallMode) -> Vec<String
             }
         }
     }
+
+    // Sweep Desktop & Start Menu for any additional/stale shortcuts targeting the deleted game folder(s)
+    let swept_lnks = sweep_shortcuts_targeting_dirs(&m.game_dirs);
+    for lnk in swept_lnks {
+        logs.push(format!("[UNINSTALL] Swept shortcut: {lnk}"));
+    }
+    crate::win_sys::notify_shell_changed();
 
     // 3. Profile/Saves & Registry cleanup (ONLY in DeleteEverything mode!)
     if mode == UninstallMode::DeleteEverything {

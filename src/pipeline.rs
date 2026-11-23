@@ -150,7 +150,10 @@ fn set_progress(
             s.download_pct = d.clamp(0.0, 1.0);
         }
         if let Some(u) = unpack {
-            s.unpack_pct = u.clamp(0.0, 1.0);
+            let clamped = u.clamp(0.0, 1.0);
+            if clamped == 0.0 || clamped >= s.unpack_pct {
+                s.unpack_pct = clamped;
+            }
         }
         if let Some(st) = stage {
             s.stage_label = st.to_string();
@@ -579,7 +582,7 @@ pub fn run_local_turbo_pipeline(
                     push_log(
                         shared,
                         format!(
-                            "[PATCH] External 64-bit {s64} active | SREP RAM -> {} MB | Threads -> 100% ({}) | IPC -> 4m/32m",
+                            "[PATCH] External 64-bit {s64} active | SREP RAM -> {} MB | Threads -> 100% ({}) | IPC -> 8m/32m",
                             report.effective_ram_mb, threads
                         ),
                     );
@@ -641,7 +644,16 @@ pub fn run_local_turbo_pipeline(
 
     let mut serial_items: Vec<(usize, PathBuf, u64, ArchiveMagic)> = Vec::new();
     let mut parallel_items: Vec<(usize, PathBuf, u64, ArchiveMagic)> = Vec::new();
-    let allow_parallel = optimizer::logical_cpu_threads() >= 4;
+    let src_is_ssd = win_sys::is_source_ssd(source_root);
+    let allow_parallel = src_is_ssd && optimizer::logical_cpu_threads() >= 4;
+    push_log(
+        shared,
+        format!(
+            "[IO] Source drive mode: {} ({})",
+            if src_is_ssd { "SSD/NVMe — parallel secondary bins ON" } else { "HDD/USB — sequential read ON (zero head thrashing)" },
+            source_root.display()
+        ),
+    );
 
     for (idx, archive_path) in archives.iter().enumerate() {
         let sz = archive_sizes[idx];
@@ -987,17 +999,26 @@ fn finalize_setup_metadata(
                     builder_scripts.len()
                 )),
             );
+            for note in dissect::patch_post_unpack_scripts(bat_path, target_game_dir, work_dir) {
+                push_log(shared, note);
+            }
             push_log(
                 shared,
                 format!("[REBUILD] Executing post-unpack builder: {}", bat_path.display()),
             );
-            run_post_unpack_bat(bat_path, target_game_dir, work_dir, fast_temp_dir, shared, control);
-            if bat_path
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("\\work\\")
+            let ok = run_post_unpack_bat(bat_path, target_game_dir, work_dir, fast_temp_dir, shared, control);
+            if ok
+                && bat_path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("\\work\\")
             {
                 ran_work_builder = true;
+            } else if !ok {
+                push_log(
+                    shared,
+                    "[WARN] Builder returned non-zero exit — keeping work\\ folder for inspection.",
+                );
             }
         }
 
@@ -1129,29 +1150,19 @@ fn finalize_setup_metadata(
         }
     }
 
-    // Determine the exact game folder(s) owned by this installation for safe future uninstallation
-    let mut owned_game_dirs = if !dirs_before.is_empty() {
-        manifest::diff_new_top_dirs(target_game_dir, dirs_before, excluded_games)
-    } else {
-        // In repair mode or when target folder was empty, infer from [Icons] top-level folders first
-        let mut from_icons = Vec::new();
-        let mut seen = HashSet::new();
-        for ic in &dissected.icon_entries {
-            let trimmed = ic.filename.trim();
-            let lower = trimmed.to_ascii_lowercase();
-            if lower.starts_with("{app}\\") || lower.starts_with("{app}/") {
-                if let Some((seg, _)) = trimmed[6..].split_once('\\').or_else(|| trimmed[6..].split_once('/')) {
-                    let cand = target_game_dir.join(seg);
-                    let sl = seg.to_ascii_lowercase();
-                    let is_ex = excluded_games.iter().any(|e| e.to_ascii_lowercase() == sl);
-                    if cand.is_dir() && !is_ex && seen.insert(sl) {
-                        from_icons.push(cand);
-                    }
-                }
-            }
+    // Always combine newly created directories with `[Icons]`-inferred game folders so reinstalling
+    // over an existing `D:\Games\<Game>` folder still tracks the real game folder for Uninstall!
+    let mut owned_game_dirs = manifest::diff_new_top_dirs(target_game_dir, dirs_before, excluded_games);
+    let mut seen_owned: HashSet<String> = owned_game_dirs
+        .iter()
+        .map(|p| p.display().to_string().to_ascii_lowercase())
+        .collect();
+    for icon_dir in dissect::infer_game_dirs_from_icons(&dissected.icon_entries, target_game_dir, excluded_games) {
+        let key = icon_dir.display().to_string().to_ascii_lowercase();
+        if seen_owned.insert(key) {
+            owned_game_dirs.push(icon_dir);
         }
-        from_icons
-    };
+    }
 
     if owned_game_dirs.is_empty() {
         owned_game_dirs.push(target_game_dir.to_path_buf());
@@ -1194,7 +1205,7 @@ fn run_post_unpack_bat(
     fast_temp_dir: &Path,
     shared: &Arc<Mutex<SharedTelemetry>>,
     control: Option<&Arc<PipelineControl>>,
-) {
+) -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -1222,36 +1233,53 @@ fn run_post_unpack_bat(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .creation_flags(0x0000_0080 | 0x0800_0000);
+        .creation_flags(0x0000_8000 | 0x0800_0000);
 
     match cmd.spawn() {
         Ok(mut child) => {
             if let Some(ctrl) = control {
                 attach_job(&child, ctrl);
             }
+            let err_handle = child.stderr.take().map(|stderr| {
+                let sh = shared.clone();
+                std::thread::spawn(move || {
+                    for line in BufReader::new(stderr).lines().flatten() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            push_log(&sh, format!("  | [stderr] {trimmed}"));
+                        }
+                    }
+                })
+            });
             if let Some(stdout) = child.stdout.take() {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
+                for line in BufReader::new(stdout).lines().flatten() {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         push_log(shared, format!("  | {trimmed}"));
                     }
                 }
             }
+            if let Some(h) = err_handle {
+                let _ = h.join();
+            }
             match child.wait() {
                 Ok(status) => {
+                    let ok = status.success();
                     push_log(
                         shared,
                         format!("[REBUILD] {} finished (exit {:?}).", bat_path.display(), status.code()),
                     );
+                    ok
                 }
                 Err(e) => {
                     push_log(shared, format!("[WARN] Error waiting on builder script: {e}"));
+                    false
                 }
             }
         }
         Err(e) => {
             push_log(shared, format!("[WARN] Could not launch {}: {e}", bat_path.display()));
+            false
         }
     }
 }
@@ -1629,11 +1657,11 @@ fn run_and_stream_logs(
 
                 if idle_secs >= 15 && total_written_bytes == 0 {
                     s.eta_text = "Crunching block...".into();
-                } else if pct >= 0.01 && pct < 0.995 {
+                } else if pct >= 0.015 && pct < 0.995 {
                     let elapsed = job_start.elapsed().as_secs_f32();
-                    let raw_rem = (elapsed / pct) * (1.0 - pct);
+                    let raw_rem = ((elapsed / pct) * (1.0 - pct)).min(36000.0);
                     let smoothed = match smooth_eta {
-                        Some(prev) => prev * 0.75 + raw_rem * 0.25,
+                        Some(prev) => prev * 0.85 + raw_rem * 0.15,
                         None => raw_rem,
                     };
                     smooth_eta = Some(smoothed);

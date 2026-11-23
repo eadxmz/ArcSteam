@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use sysinfo::System;
 
-const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,13 +155,13 @@ pub fn compute_dynamic_srep_ram() -> DynamicRamPlan {
     let total_mb = (sys.total_memory() / (1024 * 1024)).max(2048);
     let available_mb = sys.available_memory() / (1024 * 1024);
 
-    let reserved_mb = ((total_mb as f64) * 0.22).max(2048.0) as u64;
-    let ceiling_mb = ((total_mb as f64) * 0.65) as u64;
+    let reserved_mb = ((total_mb as f64) * 0.18).max(1792.0) as u64;
+    let ceiling_mb = ((total_mb as f64) * 0.70) as u64;
 
     let raw_budget = if available_mb > reserved_mb + 1024 {
         (available_mb - reserved_mb).min(ceiling_mb)
     } else {
-        ((available_mb as f64) * 0.55) as u64
+        ((available_mb as f64) * 0.60) as u64
     };
 
     // Round down to clean 128 MB step, clamped safely to [1024, 12288] MB
@@ -251,7 +251,7 @@ fn optimize_cls_ini_text(
                 "temppath" => format!("{key_raw}={temp_with_slash}"),
                 "memory" => format!("{key_raw}={effective_ram_mb}m"),
                 "maxthreadsusage" => format!("{key_raw}=100%"),
-                "transfer_readbufsize" | "transfer_writebufsize" => format!("{key_raw}=4m"),
+                "transfer_readbufsize" | "transfer_writebufsize" => format!("{key_raw}=8m"),
                 "bufsize" => {
                     if section == "[srep]" {
                         format!("{key_raw}=32m")
@@ -279,7 +279,7 @@ fn optimize_cls_ini_text(
     }
     if !lower_all.contains("[lolz]") {
         out.push_str(&format!(
-            "\n[lolz]\nMaxThreadsUsage=100%\nThreads={threads}\nTempPath={temp_with_slash}\nBufsize=4m\ntransfer_ReadBufSize=4m\ntransfer_WriteBufSize=4m\n"
+            "\n[lolz]\nMaxThreadsUsage=100%\nThreads={threads}\nTempPath={temp_with_slash}\nBufsize=4m\ntransfer_ReadBufSize=8m\ntransfer_WriteBufSize=8m\n"
         ));
     }
     out
@@ -387,9 +387,9 @@ pub fn spawn_turbo_process(
     }
 
     let flags = if show_window {
-        HIGH_PRIORITY_CLASS
+        ABOVE_NORMAL_PRIORITY_CLASS
     } else {
-        HIGH_PRIORITY_CLASS | CREATE_NO_WINDOW
+        ABOVE_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW
     };
     cmd.creation_flags(flags);
 

@@ -418,3 +418,49 @@ pub fn check_legacy_game_runtimes() -> Vec<&'static str> {
     }
     missing
 }
+
+/// Detects whether the drive hosting `path` is an SSD/NVMe (safe for parallel archive reads)
+/// vs a spinning HDD / USB external drive (where sequential reading avoids read-head thrashing).
+pub fn is_source_ssd(path: &Path) -> bool {
+    let s = path.display().to_string();
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' {
+        return false;
+    }
+    let letter = (bytes[0] as char).to_ascii_uppercase();
+    let ps = format!(
+        "$d = Get-Partition -DriveLetter '{letter}' -ErrorAction SilentlyContinue | Get-Disk -ErrorAction SilentlyContinue; \
+         if ($null -eq $d) {{ 'UNKNOWN'; exit }} \
+         $pd = Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object {{ $_.DeviceId -eq [string]$d.Number }} | Select-Object -First 1; \
+         $mt = if ($pd) {{ [string]$pd.MediaType }} else {{ 'Unspecified' }}; \
+         $bt = [string]$d.BusType; \
+         Write-Output \"$mt|$bt\""
+    );
+    let Ok(out) = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return false;
+    };
+    let info = String::from_utf8_lossy(&out.stdout).trim().to_ascii_uppercase();
+    if info.starts_with("SSD|") || info.starts_with("SCM|") {
+        return true;
+    }
+    if info.starts_with("HDD|") {
+        return false;
+    }
+    // Unspecified media type: NVMe is always solid-state; USB bridges default to sequential (safe for external HDDs)
+    info.contains("|NVME")
+}
+
+/// Notifies Windows Explorer & Start Menu that shortcuts/folders changed so stale icons clear immediately.
+pub fn notify_shell_changed() {
+    let ps = "Add-Type -Namespace Win32 -Name Shell -MemberDefinition \
+              '[DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);'; \
+              [Win32.Shell]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)";
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}

@@ -826,3 +826,246 @@ pub fn detect_script_cwd_and_args(bat_path: &Path, target_app_dir: &Path) -> (Pa
 
     (cwd, needs_app_arg)
 }
+
+
+/// Resolves FitGirl/DODI placeholder tokens (e.g. `fitgirl2-path`, `fitgirl1-path`, `fitgirl-path`,
+/// `{app}`, `{tmp}`) across ALL `.bat`, `.cmd`, `.txt`, `.ini`, and `.cfg` files inside the `work\`
+/// tree before executing `build*.bat`.
+///
+/// For every `fitgirl*-path` token, dynamically probes the path segment immediately following the
+/// token against real files on disk (`bat_dir.parent()`, `target_app_dir`, `bat_dir`, `work_dir`)
+/// so `fitgirl2-path\work\run.exe` resolves to `D:\Games\work\work\run.exe` while
+/// `fitgirl-path\eng.fgpack.x5` resolves to `D:\Games\eng.fgpack.x5`.
+///
+/// Also strips self-deleting `del ...build*.bat` lines so `cmd.exe` returns `run.exe`'s real exit code.
+pub fn patch_post_unpack_scripts(
+    bat_path: &Path,
+    target_app_dir: &Path,
+    work_dir: &Path,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let bat_dir = bat_path.parent().unwrap_or(target_app_dir);
+    let bat_parent = bat_dir.parent().unwrap_or(target_app_dir);
+
+    // Find the top-level `work` root inside target_app_dir (or fall back to bat_dir)
+    let work_tree = {
+        let candidate = target_app_dir.join("work");
+        if candidate.is_dir() && bat_path.starts_with(&candidate) {
+            candidate
+        } else {
+            bat_dir.to_path_buf()
+        }
+    };
+
+    let app_str = target_app_dir
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+    let bat_dir_str = bat_dir
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+    let bat_parent_str = bat_parent
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+    let work_dir_str = work_dir
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+
+    // Collect all script/config text files under work_tree
+    let mut text_files = Vec::new();
+    for entry in WalkDir::new(&work_tree).max_depth(4).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(ext.as_str(), "bat" | "cmd" | "txt" | "ini" | "cfg" | "lst") {
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() <= 16 * 1024 * 1024 {
+                    text_files.push(path.to_path_buf());
+                }
+            }
+        }
+    }
+
+    // 1. Discover every `fitgirl*-path` token and probe which real base folder matches disk files
+    let re_tok_rel = Regex::new(r#"(?i)(fitgirl\d*-path)([\\/][^"'\r\n<>|]+)"#).unwrap();
+    let re_tok_any = Regex::new(r#"(?i)(fitgirl\d*-path)"#).unwrap();
+
+    let mut token_names: Vec<String> = Vec::new();
+    let mut seen_tokens: HashSet<String> = HashSet::new();
+    let mut file_contents: Vec<(PathBuf, String)> = Vec::new();
+
+    for fpath in text_files {
+        let Ok(bytes) = fs::read(&fpath) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        for cap in re_tok_any.captures_iter(&content) {
+            let tok_l = cap[1].to_ascii_lowercase();
+            if seen_tokens.insert(tok_l.clone()) {
+                token_names.push(tok_l);
+            }
+        }
+        file_contents.push((fpath, content));
+    }
+
+    let candidates: [(&str, PathBuf); 4] = [
+        (&bat_parent_str, bat_parent.to_path_buf()),
+        (&app_str, target_app_dir.to_path_buf()),
+        (&bat_dir_str, bat_dir.to_path_buf()),
+        (&work_dir_str, work_dir.to_path_buf()),
+    ];
+
+    let mut resolved_map: Vec<(String, String)> = Vec::new();
+    for tok in &token_names {
+        let mut scores = [0i32; 4];
+        for (_, content) in &file_contents {
+            for cap in re_tok_rel.captures_iter(content) {
+                if !cap[1].eq_ignore_ascii_case(tok) {
+                    continue;
+                }
+                let raw_rel = cap[2].trim();
+                let rel_clean = raw_rel.trim_start_matches(['\\', '/']);
+                if rel_clean.is_empty() {
+                    continue;
+                }
+                // Check full relative path first, then first 1-2 path segments
+                let first_two: String = rel_clean
+                    .split(['\\', '/'])
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join("\\");
+                let first_one = rel_clean.split(['\\', '/']).next().unwrap_or("");
+                let unquoted = rel_clean.split_whitespace().next().unwrap_or(rel_clean);
+
+                for (ci, (_, base_p)) in candidates.iter().enumerate() {
+                    if base_p.join(rel_clean).exists() || base_p.join(unquoted).exists() {
+                        scores[ci] += 10;
+                    } else if !first_two.is_empty() && base_p.join(&first_two).exists() {
+                        scores[ci] += 4;
+                    } else if !first_one.is_empty() && base_p.join(first_one).exists() {
+                        scores[ci] += 1;
+                    }
+                }
+            }
+        }
+
+        let best_idx = scores
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &sc)| sc)
+            .filter(|(_, &sc)| sc > 0)
+            .map(|(i, _)| i);
+
+        let chosen = if let Some(idx) = best_idx {
+            candidates[idx].0.to_string()
+        } else if tok == "fitgirl2-path" {
+            bat_parent_str.clone()
+        } else {
+            app_str.clone()
+        };
+
+        notes.push(format!("[REBUILD] Resolved {tok} -> {chosen}"));
+        resolved_map.push((tok.clone(), chosen));
+    }
+
+    // 2. Rewrite every matched file cleanly
+    let mut patched_count = 0usize;
+    let bat_name_lower = bat_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    for (fpath, orig) in file_contents {
+        let mut updated = orig.clone();
+        for (tok, target) in &resolved_map {
+            let re = Regex::new(&format!("(?i){}", regex::escape(tok))).unwrap();
+            updated = re.replace_all(&updated, regex::NoExpand(target.as_str())).into_owned();
+        }
+        updated = updated
+            .replace("{app}", &app_str)
+            .replace("{APP}", &app_str)
+            .replace("{tmp}", &work_dir_str)
+            .replace("{TMP}", &work_dir_str);
+
+        // Strip self-deletion of the running .bat so cmd.exe returns run.exe's real exit code
+        let is_this_bat = fpath == bat_path;
+        if is_this_bat && !bat_name_lower.is_empty() {
+            let mut kept_lines = Vec::new();
+            for line in updated.lines() {
+                let l = line.trim().to_ascii_lowercase();
+                if l.starts_with("del ") && l.contains(&bat_name_lower) {
+                    continue;
+                }
+                kept_lines.push(line);
+            }
+            updated = kept_lines.join("\r\n") + "\r\n";
+        }
+
+        if updated != orig {
+            if fs::write(&fpath, updated.as_bytes()).is_ok() {
+                patched_count += 1;
+            }
+        }
+    }
+
+    if patched_count > 0 {
+        notes.push(format!(
+            "[REBUILD] Patched placeholders in {patched_count} builder script/job file(s)."
+        ));
+    }
+    notes
+}
+
+/// Infers top-level game directories owned by an install from `[Icons]` entries
+/// (ignoring generic engine folders like `bin`, `data`, `support`, `work`).
+pub fn infer_game_dirs_from_icons(
+    icons: &[IconEntry],
+    target_app_dir: &Path,
+    excluded_games: &[String],
+) -> Vec<PathBuf> {
+    let generic_dirs = [
+        "bin", "bin32", "bin64", "binaries", "data", "data_win32", "engine", "game",
+        "support", "redist", "_redist", "commonredist", "work", "docs", "manual",
+        "patch", "update", "crack", "nodvd", "tools", "system", "x64", "x86", "win64",
+        "win32", "launch", "launcher",
+    ];
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for ic in icons {
+        let trimmed = ic.filename.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("{app}\\") || lower.starts_with("{app}/") {
+            if let Some((seg, tail)) = trimmed[6..]
+                .split_once('\\')
+                .or_else(|| trimmed[6..].split_once('/'))
+            {
+                let sl = seg.trim().to_ascii_lowercase();
+                let is_ex = excluded_games.iter().any(|e| e.to_ascii_lowercase() == sl);
+                let cand = target_app_dir.join(seg.trim());
+                if !sl.is_empty()
+                    && !tail.is_empty()
+                    && !generic_dirs.contains(&sl.as_str())
+                    && !is_ex
+                    && cand.is_dir()
+                    && seen.insert(sl)
+                {
+                    dirs.push(cand);
+                }
+            }
+        }
+    }
+    dirs
+}
