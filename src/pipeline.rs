@@ -552,7 +552,7 @@ pub fn run_local_turbo_pipeline(
                 // Promote `stage_dirpp` into `target_game_dir\<Game Name>`
                 let game_folder_name = cfg
                     .display_name
-                    .replace([':', '*', '?', '"', '<', '>', '|', '\', '/'], "")
+                    .replace([':', '*', '?', '"', '<', '>', '|', '\\', '/'], "")
                     .trim()
                     .to_string();
                 let clean_name = if game_folder_name.is_empty() {
@@ -583,7 +583,7 @@ pub fn run_local_turbo_pipeline(
                         .unwrap_or(&main_exe);
                     gog_dissected.icon_entries.push(dissect::IconEntry {
                         name: clean_name.clone(),
-                        filename: format!("{{app}}\{}", rel_exe.display()),
+                        filename: format!("{{app}}\\{}", rel_exe.display()),
                         working_dir: String::new(),
                     });
                 }
