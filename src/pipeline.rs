@@ -1042,6 +1042,20 @@ fn finalize_setup_metadata(
     let fast_temp_dir = &cfg.fast_temp_dir;
     let excluded_games = &cfg.excluded_games;
 
+    // 0. Deploy embedded setup.exe `{app}` files FIRST (matches Inno Setup `ssInstall` before
+    //    `CurStepChanged(ssPostInstall)` so files like `cze.fgpack.x5` and `_Redist\*.addon` are
+    //    present for `x5.exe` / `copy /b` and then cleaned up by the IFPS steps!).
+    let mut tracked_profiles: Vec<PathBuf> = Vec::new();
+    let (embedded_copied, ext_profiles) =
+        dissect::deploy_embedded_setup_files(work_dir, target_game_dir, excluded_games);
+    tracked_profiles.extend(ext_profiles);
+    if embedded_copied > 0 {
+        push_log(
+            shared,
+            format!("[SETUP] Deployed {embedded_copied} embedded file(s) from setup.exe."),
+        );
+    }
+
     // 1. Replay compiled Inno Setup IFPS post-unpack pipeline (`ISExec` + nested `ISArcExtract`)
     //    if `embedded\CompiledCode.bin` is present (handles delzo, x5, x2n, x3, builder, sfk, fart,
     //    build01.bat, and nested `{app}\*.fgpack` archives in exact installer order!).
@@ -1157,17 +1171,7 @@ fn finalize_setup_metadata(
 
     set_progress(shared, None, Some(0.98), Some("Deploying setup files, shortcuts & uninstall manifest..."));
 
-    let mut tracked_profiles: Vec<PathBuf> = Vec::new();
 
-    let (embedded_copied, ext_profiles) =
-        dissect::deploy_embedded_setup_files(work_dir, target_game_dir, excluded_games);
-    tracked_profiles.extend(ext_profiles);
-    if embedded_copied > 0 {
-        push_log(
-            shared,
-            format!("[SETUP] Deployed {embedded_copied} embedded file(s) from setup.exe."),
-        );
-    }
 
     if !dissected.dir_entries.is_empty() {
         let (dir_count, dir_profiles) =
@@ -1989,27 +1993,33 @@ fn mirror_work_tools_into_tmp(target_game_dir: &Path, work_dir: &Path) {
 fn targets_only_excluded_game(
     text_a: &str,
     text_b: &str,
+    text_c: &str,
     excluded_games: &[String],
 ) -> bool {
     if excluded_games.is_empty() {
         return false;
     }
-    let a = text_a.to_ascii_lowercase();
-    let b = text_b.to_ascii_lowercase();
+    let haystacks = [
+        text_a.to_ascii_lowercase(),
+        text_b.to_ascii_lowercase(),
+        text_c.to_ascii_lowercase(),
+    ];
     for ex in excluded_games {
         let exl = ex.to_ascii_lowercase();
         let needle_bs = format!("\\{exl}\\");
         let needle_fs = format!("/{exl}/");
         let needle_q = format!("\"{exl}\\");
+        let needle_start = format!("{exl}\\");
         let needle_end = format!("\\{exl}");
-        if a.contains(&needle_bs)
-            || a.contains(&needle_fs)
-            || a.ends_with(&needle_end)
-            || b.contains(&needle_bs)
-            || b.contains(&needle_fs)
-            || b.contains(&needle_q)
-        {
-            return true;
+        for h in &haystacks {
+            if h.contains(&needle_bs)
+                || h.contains(&needle_fs)
+                || h.contains(&needle_q)
+                || h.starts_with(&needle_start)
+                || h.ends_with(&needle_end)
+            {
+                return true;
+            }
         }
     }
     false
@@ -2070,13 +2080,13 @@ fn replay_ifps_post_unpack(
                 }
                 runnable.push(act);
             }
-            IfpsAction::Exec { exe, params, target_dir, .. } => {
+            IfpsAction::Exec { exe, params, target_dir, desc } => {
                 let el = exe.to_ascii_lowercase();
                 let pl = params.to_ascii_lowercase();
                 if is_blocked_ifps_exec(&el, &pl) {
                     continue;
                 }
-                if targets_only_excluded_game(target_dir, params, excluded_games) {
+                if targets_only_excluded_game(target_dir, params, desc, excluded_games) {
                     continue;
                 }
                 runnable.push(act);
@@ -2221,8 +2231,35 @@ fn replay_ifps_post_unpack(
                     let stripped = trimmed
                         .strip_prefix("/c ")
                         .or_else(|| trimmed.strip_prefix("/C "))
-                        .unwrap_or(trimmed);
-                    stripped.to_string()
+                        .unwrap_or(trimmed)
+                        .trim();
+                    // FitGirl often emits `/C "del *.fgpack&&del *.x5"` or `/C "del "Far Cry 3\fc3.fgpack""`
+                    // (relying on cmd.exe's outer-quote stripping). Unwrap that single outer quote pair
+                    // whenever the command starts with a shell builtin or double quote (`""...`)!
+                    let low_s = stripped.to_ascii_lowercase();
+                    let quoted_builtin = stripped.starts_with('"')
+                        && stripped.ends_with('"')
+                        && stripped.len() >= 2
+                        && (low_s.starts_with("\"del ")
+                            || low_s.starts_with("\"copy ")
+                            || low_s.starts_with("\"mkdir ")
+                            || low_s.starts_with("\"md ")
+                            || low_s.starts_with("\"rd ")
+                            || low_s.starts_with("\"rmdir ")
+                            || low_s.starts_with("\"move ")
+                            || low_s.starts_with("\"ren ")
+                            || low_s.starts_with("\"rename ")
+                            || low_s.starts_with("\"echo ")
+                            || low_s.starts_with("\"xcopy ")
+                            || low_s.starts_with("\"attrib ")
+                            || low_s.starts_with("\"if ")
+                            || low_s.starts_with("\"for ")
+                            || stripped.starts_with("\"\""));
+                    if quoted_builtin {
+                        stripped[1..stripped.len() - 1].to_string()
+                    } else {
+                        stripped.to_string()
+                    }
                 } else {
                     // Verify external helper exists if it's an absolute path
                     let ep = Path::new(&exe_exp);
@@ -2292,7 +2329,12 @@ fn replay_ifps_post_unpack(
                             for line in BufReader::new(so).lines().flatten() {
                                 let t = line.trim();
                                 if !t.is_empty() && shown < 12 {
-                                    push_log(shared, format!("  | {t}"));
+                                    let is_mpz_noise = t.len() > 20
+                    && t.starts_with(|c: char| c.is_ascii_digit())
+                    && t.bytes().all(|b| b.is_ascii_digit() || b == b' ' || b == b'\r' || b == b'\n');
+                if !is_mpz_noise {
+                    push_log(shared, format!("  | {t}"));
+                }
                                     shown += 1;
                                 }
                             }

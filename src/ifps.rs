@@ -152,6 +152,26 @@ fn decode_utf16le(b: &[u8]) -> String {
     String::from_utf16_lossy(&u16s)
 }
 
+fn extract_file_path_inno(s: &str) -> String {
+    match s.rfind(['\\', '/', ':']) {
+        Some(idx) => s[..=idx].to_string(),
+        None => String::new(),
+    }
+}
+
+fn extract_file_dir_inno(s: &str) -> String {
+    match s.rfind(['\\', '/']) {
+        Some(idx) => {
+            if idx > 0 && s.as_bytes()[idx - 1] == b':' {
+                s[..=idx].to_string()
+            } else {
+                s[..idx].to_string()
+            }
+        }
+        None => String::new(),
+    }
+}
+
 fn read_const_val(
     r: &mut Reader<'_>,
     tidx: usize,
@@ -167,7 +187,7 @@ fn read_const_val(
         BT_S8 | BT_CHAR => Some(IfpsVal::Int(r.u8()? as i8 as i64)),
         BT_U16 | BT_WIDECHAR => Some(IfpsVal::Int(r.u16()? as i64)),
         BT_S16 => Some(IfpsVal::Int(r.u16()? as i16 as i64)),
-        BT_U32 | BT_SINGLE => Some(IfpsVal::Int(r.u32()? as i64)),
+        BT_U32 | BT_SINGLE | BT_PROCPTR => Some(IfpsVal::Int(r.u32()? as i64)),
         BT_S32 => Some(IfpsVal::Int(r.i32()? as i64)),
         BT_DOUBLE | BT_S64 | BT_CURRENCY => Some(IfpsVal::Int(r.u64()? as i64)),
         BT_EXTENDED => {
@@ -184,10 +204,11 @@ fn read_const_val(
         }
         BT_UNICODESTRING | BT_WIDESTRING => {
             let ln = r.u32()? as usize;
-            if ln > 4 * 1024 * 1024 {
+            let byte_len = ln.checked_mul(2)?;
+            if byte_len > 8 * 1024 * 1024 {
                 return None;
             }
-            let b = r.bytes(ln)?;
+            let b = r.bytes(byte_len)?;
             Some(IfpsVal::Str(decode_utf16le(b)))
         }
         BT_SET => {
@@ -195,11 +216,8 @@ fn read_const_val(
             r.bytes(sz)?;
             Some(IfpsVal::None)
         }
-        BT_POINTER | BT_RESPTR | BT_VARIANT | BT_PROCPTR | BT_CLASS | BT_INTERFACE
-        | BT_NOTIFVAR | BT_RECORD | BT_ARRAY | BT_STATICARRAY => {
-            // Fallback for rare pointer/empty constants
-            Some(IfpsVal::None)
-        }
+        BT_POINTER | BT_RESPTR | BT_VARIANT | BT_CLASS | BT_INTERFACE | BT_NOTIFVAR
+        | BT_RECORD | BT_ARRAY | BT_STATICARRAY => Some(IfpsVal::None),
         _ => None,
     }
 }
@@ -260,40 +278,14 @@ fn read_varspec(
     }
 }
 
-fn peek_varspec_valid(
-    data: &[u8],
-    pos: usize,
-    types: &[u8],
-    set_sizes: &HashMap<usize, usize>,
-) -> bool {
-    let mut r = Reader::new(data, pos);
-    let Some(kind) = r.u8() else {
-        return false;
-    };
-    match kind {
-        0 => r.u32().is_some(),
-        1 => {
-            let Some(tidx) = r.u32() else {
-                return false;
-            };
-            (tidx as usize) < types.len()
-                && read_const_val(&mut r, tidx as usize, types, set_sizes).is_some()
-        }
-        2 | 3 => r.u32().is_some() && r.u32().is_some(),
-        _ => false,
-    }
-}
-
 fn resolve_val(spec: &VarSpec, vars: &HashMap<u32, IfpsVal>) -> IfpsVal {
     match spec {
         VarSpec::Const(v) => v.clone(),
-        VarSpec::Var(id) => {
-            match vars.get(id) {
-                Some(IfpsVal::Ref(target)) => vars.get(target).cloned().unwrap_or(IfpsVal::None),
-                Some(v) => v.clone(),
-                None => IfpsVal::None,
-            }
-        }
+        VarSpec::Var(id) => match vars.get(id) {
+            Some(IfpsVal::Ref(target)) => vars.get(target).cloned().unwrap_or(IfpsVal::None),
+            Some(v) => v.clone(),
+            None => IfpsVal::None,
+        },
         VarSpec::IndexedConst(_, _) | VarSpec::IndexedVar(_, _) => IfpsVal::None,
     }
 }
@@ -438,20 +430,13 @@ pub fn extract_post_unpack_actions(compiled_code_path: &Path) -> (Vec<IfpsAction
     }
     let code_base = r.pos;
 
-    let expand_id = procs
+    let has_is_exec = procs
         .iter()
-        .position(|p| p.ext && p.name.eq_ignore_ascii_case("EXPANDCONSTANT"))
-        .map(|i| i as u32);
-    let is_exec_id = procs
+        .any(|p| p.ext && p.name.eq_ignore_ascii_case("ISExec"));
+    let has_is_arc = procs
         .iter()
-        .position(|p| p.ext && p.name.eq_ignore_ascii_case("ISExec"))
-        .map(|i| i as u32);
-    let is_arc_id = procs
-        .iter()
-        .position(|p| p.ext && p.name.eq_ignore_ascii_case("ISArcExtract"))
-        .map(|i| i as u32);
-
-    if is_exec_id.is_none() && is_arc_id.is_none() {
+        .any(|p| p.ext && p.name.eq_ignore_ascii_case("ISArcExtract"));
+    if !has_is_exec && !has_is_arc {
         return (Vec::new(), notes);
     }
 
@@ -487,14 +472,7 @@ pub fn extract_post_unpack_actions(compiled_code_path: &Path) -> (Vec<IfpsAction
         if start >= end {
             continue;
         }
-        let mut proc_actions = scan_proc_bytecode(
-            &data[start..end],
-            &types,
-            &set_sizes,
-            expand_id,
-            is_exec_id,
-            is_arc_id,
-        );
+        let mut proc_actions = scan_proc_bytecode(&data[start..end], &types, &set_sizes, &procs);
         actions.append(&mut proc_actions);
     }
 
@@ -519,16 +497,13 @@ fn scan_proc_bytecode(
     code: &[u8],
     types: &[u8],
     set_sizes: &HashMap<usize, usize>,
-    expand_id: Option<u32>,
-    is_exec_id: Option<u32>,
-    is_arc_id: Option<u32>,
+    procs: &[ProcInfo],
 ) -> Vec<IfpsAction> {
     let mut actions = Vec::new();
     let mut r = Reader::new(code, 0);
     let mut vars: HashMap<u32, IfpsVal> = HashMap::new();
     let mut stack: Vec<StackSlot> = Vec::new();
     let mut next_slot_id: u32 = 0x6000_0001;
-    let mut calibrated = false;
 
     while r.remaining() > 0 {
         let op_pos = r.pos;
@@ -547,18 +522,17 @@ fn scan_proc_bytecode(
                 };
                 let val = resolve_val(&src, &vars);
                 if let VarSpec::Var(dst_id) = dst {
-                    // Self-calibrate stack slot numbering on the first stack-var assignment
-                    if !calibrated && dst_id >= 0x6000_0000 && !stack.is_empty() {
-                        let top_idx = stack.len() - 1;
-                        let expected = stack[top_idx].id;
-                        if dst_id != expected && dst_id >= 0x6000_0000 && dst_id < 0x6000_1000 {
-                            let delta = dst_id as i64 - expected as i64;
-                            for sl in &mut stack {
-                                sl.id = (sl.id as i64 + delta) as u32;
-                            }
-                            next_slot_id = (next_slot_id as i64 + delta) as u32;
+                    if dst_id >= 0x6000_0000
+                        && dst_id < 0x6000_1000
+                        && !stack.is_empty()
+                        && !stack.iter().any(|s| s.id == dst_id)
+                    {
+                        let top_id = stack[stack.len() - 1].id;
+                        let delta = dst_id as i64 - top_id as i64;
+                        for sl in &mut stack {
+                            sl.id = (sl.id as i64 + delta) as u32;
                         }
-                        calibrated = true;
+                        next_slot_id = (next_slot_id as i64 + delta) as u32;
                     }
                     write_var(dst_id, val, &mut vars, &mut stack);
                 }
@@ -575,12 +549,12 @@ fn scan_proc_bytecode(
                     continue;
                 };
                 if calc_op == 0 {
-                    // String concatenation: dst := dst + src
                     if let VarSpec::Var(dst_id) = dst {
                         let lhs = resolve_val(&VarSpec::Var(dst_id), &vars);
                         let rhs = resolve_val(&src, &vars);
-                        if let (IfpsVal::Str(a), IfpsVal::Str(b)) = (lhs, rhs) {
-                            write_var(dst_id, IfpsVal::Str(format!("{a}{b}")), &mut vars, &mut stack);
+                        if matches!(lhs, IfpsVal::Str(_)) || matches!(rhs, IfpsVal::Str(_)) {
+                            let combined = format!("{}{}", lhs.as_string(), rhs.as_string());
+                            write_var(dst_id, IfpsVal::Str(combined), &mut vars, &mut stack);
                         }
                     }
                 }
@@ -622,50 +596,130 @@ fn scan_proc_bytecode(
             0x05 => {
                 let Some(proc_no) = r.u32() else { break; };
                 let slen = stack.len();
+                let Some(pinfo) = procs.get(proc_no as usize) else {
+                    continue;
+                };
+                if !pinfo.ext {
+                    continue;
+                }
+                let up = pinfo.name.to_ascii_uppercase();
 
-                if expand_id == Some(proc_no) && slen >= 2 {
-                    // stack[slen - 1] = result ref, stack[slen - 2] = arg0 string
-                    let arg0 = resolve_slot_val(&stack[slen - 2], &vars);
-                    if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
-                        write_var(res_target, arg0, &mut vars, &mut stack);
+                match up.as_str() {
+                    "EXPANDCONSTANT" if slen >= 2 => {
+                        let arg0 = resolve_slot_val(&stack[slen - 2], &vars);
+                        if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
+                            write_var(res_target, arg0, &mut vars, &mut stack);
+                        }
                     }
-                } else if is_exec_id == Some(proc_no) && slen >= 9 {
-                    // ISExec(CurComponent, PctOfTotal, SpecTime, ExeName, Parameters, TargetDir, OutputStr, Show): Boolean
-                    // Stack top-down: [top]=Result, [top-1]=p0, [top-2]=p1, [top-3]=p2,
-                    //                 [top-4]=ExeName, [top-5]=Parameters, [top-6]=TargetDir, [top-7]=OutputStr, [top-8]=Show
-                    let exe = resolve_slot_val(&stack[slen - 5], &vars).as_string();
-                    let params = resolve_slot_val(&stack[slen - 6], &vars).as_string();
-                    let target_dir = resolve_slot_val(&stack[slen - 7], &vars).as_string();
-                    let desc = resolve_slot_val(&stack[slen - 8], &vars).as_string();
-                    if !exe.trim().is_empty() {
-                        actions.push(IfpsAction::Exec {
-                            exe,
-                            params,
-                            target_dir,
-                            desc,
-                        });
+                    "ADDQUOTES" if slen >= 2 => {
+                        let s = resolve_slot_val(&stack[slen - 2], &vars).as_string();
+                        let quoted = if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+                            s
+                        } else {
+                            format!("\"{s}\"")
+                        };
+                        if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
+                            write_var(res_target, IfpsVal::Str(quoted), &mut vars, &mut stack);
+                        }
                     }
-                } else if is_arc_id == Some(proc_no) && slen >= 11 {
-                    // ISArcExtract(CurComp, Pct, InName, OutPath, ExtractedPath, DeleteInFile, Password, CfgFile, WorkPath, ExtractPCF): Boolean
-                    // Stack top-down: [top]=Result, [top-1]=p0, [top-2]=p1, [top-3]=InName,
-                    //                 [top-4]=OutPath, [top-5]=ExtractedPath, [top-6]=DeleteInFile, [top-7]=Password
-                    let archive = resolve_slot_val(&stack[slen - 4], &vars).as_string();
-                    let out_dir = resolve_slot_val(&stack[slen - 5], &vars).as_string();
-                    let delete_after = resolve_slot_val(&stack[slen - 7], &vars).as_bool();
-                    let password = resolve_slot_val(&stack[slen - 8], &vars).as_string();
-                    if !archive.trim().is_empty() {
-                        actions.push(IfpsAction::ArcExtract {
-                            archive,
-                            out_dir,
-                            delete_after,
-                            password,
-                        });
+                    "EXTRACTFILEPATH" if slen >= 2 => {
+                        let s = resolve_slot_val(&stack[slen - 2], &vars).as_string();
+                        let dir = extract_file_path_inno(&s);
+                        if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
+                            write_var(res_target, IfpsVal::Str(dir), &mut vars, &mut stack);
+                        }
                     }
+                    "EXTRACTFILEDIR" if slen >= 2 => {
+                        let s = resolve_slot_val(&stack[slen - 2], &vars).as_string();
+                        let dir = extract_file_dir_inno(&s);
+                        if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
+                            write_var(res_target, IfpsVal::Str(dir), &mut vars, &mut stack);
+                        }
+                    }
+                    "REMOVEBACKSLASH" | "REMOVEBACKSLASHUNLESSROOT" if slen >= 2 => {
+                        let s = resolve_slot_val(&stack[slen - 2], &vars).as_string();
+                        let trimmed = if s.len() > 3 && s.ends_with('\\') {
+                            s[..s.len() - 1].to_string()
+                        } else {
+                            s
+                        };
+                        if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
+                            write_var(res_target, IfpsVal::Str(trimmed), &mut vars, &mut stack);
+                        }
+                    }
+                    "ADDBACKSLASH" if slen >= 2 => {
+                        let s = resolve_slot_val(&stack[slen - 2], &vars).as_string();
+                        let out = if s.is_empty() || s.ends_with('\\') {
+                            s
+                        } else {
+                            format!("{s}\\")
+                        };
+                        if let IfpsVal::Ref(res_target) = stack[slen - 1].val {
+                            write_var(res_target, IfpsVal::Str(out), &mut vars, &mut stack);
+                        }
+                    }
+                    "ISEXEC" if slen >= 9 => {
+                        let exe = resolve_slot_val(&stack[slen - 5], &vars).as_string();
+                        let params = resolve_slot_val(&stack[slen - 6], &vars).as_string();
+                        let target_dir = resolve_slot_val(&stack[slen - 7], &vars).as_string();
+                        let desc = resolve_slot_val(&stack[slen - 8], &vars).as_string();
+                        if !exe.trim().is_empty() {
+                            actions.push(IfpsAction::Exec {
+                                exe,
+                                params,
+                                target_dir,
+                                desc,
+                            });
+                        }
+                    }
+                    "ISARCEXTRACT" if slen >= 11 => {
+                        let archive = resolve_slot_val(&stack[slen - 4], &vars).as_string();
+                        let out_dir = resolve_slot_val(&stack[slen - 5], &vars).as_string();
+                        let delete_after = resolve_slot_val(&stack[slen - 7], &vars).as_bool();
+                        let raw_pwd = resolve_slot_val(&stack[slen - 8], &vars).as_string();
+                        // Guard against custom ISDone scripts passing `{tmp}\unarc.dll` or `.ini` in p6
+                        let pwd_low = raw_pwd.to_ascii_lowercase();
+                        let password = if raw_pwd.contains('{')
+                            || raw_pwd.contains('\\')
+                            || raw_pwd.contains('/')
+                            || pwd_low.ends_with(".dll")
+                            || pwd_low.ends_with(".ini")
+                        {
+                            String::new()
+                        } else {
+                            raw_pwd
+                        };
+                        if !archive.trim().is_empty() {
+                            actions.push(IfpsAction::ArcExtract {
+                                archive,
+                                out_dir,
+                                delete_after,
+                                password,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
-            // CM_G (Goto), CM_FG (FlagGoto), CM_PopJump, CM_PopPopJump: i32
-            0x06 | 0x0F | 0x16 | 0x17 => {
+            // CM_G (Goto), CM_FG (FlagGoto): i32
+            0x06 | 0x12 => {
                 if r.i32().is_none() { break; }
+            }
+            // CM_PopJump: i32 + pop 1
+            0x19 => {
+                if r.i32().is_none() { break; }
+                if let Some(popped) = stack.pop() {
+                    next_slot_id = popped.id;
+                }
+            }
+            // CM_PopPopJump: i32 + pop 2
+            0x1A => {
+                if r.i32().is_none() { break; }
+                for _ in 0..2 {
+                    if let Some(popped) = stack.pop() {
+                        next_slot_id = popped.id;
+                    }
+                }
             }
             // CM_CG (CondGoto), CM_CNG (CondNotGoto): i32, VarSpec
             0x07 | 0x08 => {
@@ -701,37 +755,34 @@ fn scan_proc_bytecode(
                     r.pos = op_pos + 1;
                 }
             }
-            // CM_CV (CallVar), CM_N (Not), CM_Inc, CM_Dec, CM_Neg, CM_SetZ: 1 VarSpec
-            0x0D | 0x12 | 0x14 | 0x15 | 0x18 | 0x19 => {
+            // Single-VarSpec opcodes: CM_CV, CM_BNot, CM_Neg, CM_SetZ, CM_Inc, CM_Dec
+            0x0D | 0x0F | 0x10 | 0x15 | 0x17 | 0x18 => {
                 if read_varspec(&mut r, types, set_sizes).is_none() {
                     r.pos = op_pos + 1;
                 }
             }
+            // Two-VarSpec pointer opcodes: CM_SP (SetPointerToCopy), CM_SPC (SetCopyPointer)
+            0x0E | 0x16 => {
+                if read_varspec(&mut r, types, set_sizes).is_none()
+                    || read_varspec(&mut r, types, set_sizes).is_none()
+                {
+                    r.pos = op_pos + 1;
+                }
+            }
             // CM_SF (SetFlag): VarSpec, negate: u8
-            0x0E => {
+            0x11 => {
                 if read_varspec(&mut r, types, set_sizes).is_none() || r.u8().is_none() {
                     r.pos = op_pos + 1;
                 }
             }
             // CM_P2 (PushEH): 4 * u32
-            0x10 => {
+            0x13 => {
                 if r.bytes(16).is_none() { break; }
             }
             // CM_P2E (PopEH): u8
-            0x11 => {
+            0x14 => {
                 if r.u8().is_none() { break; }
             }
-            // CM_SPC (SetCopyPointer): 2 VarSpecs (with safe 1-VarSpec fallback)
-            0x13 => {
-                if read_varspec(&mut r, types, set_sizes).is_none() {
-                    r.pos = op_pos + 1;
-                    continue;
-                }
-                if peek_varspec_valid(code, r.pos, types, set_sizes) {
-                    let _ = read_varspec(&mut r, types, set_sizes);
-                }
-            }
-            // Unknown opcode: step forward cleanly without losing stack tracking
             _ => {}
         }
     }

@@ -61,8 +61,16 @@ fn common_docs_dir() -> PathBuf {
 }
 
 pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> String {
-    let app_str = target_app_dir.display().to_string();
-    let tmp_str = work_dir.display().to_string();
+    let app_str = target_app_dir
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+    let tmp_str = work_dir
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
     let docs_str = user_docs_dir().display().to_string();
     let cdocs_str = common_docs_dir().display().to_string();
     let appdata = env_dir("APPDATA", r"C:\Users\Default\AppData\Roaming");
@@ -70,6 +78,7 @@ pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> 
     let progdata = env_dir("PROGRAMDATA", r"C:\ProgramData");
     let windir = env_dir("WINDIR", r"C:\Windows");
     let sysdir = format!(r"{windir}\System32");
+    let cmd_exe = format!(r"{sysdir}\cmd.exe");
 
     let mut out = raw.to_string();
     let pairs = [
@@ -77,6 +86,8 @@ pub fn expand_inno_tokens(raw: &str, target_app_dir: &Path, work_dir: &Path) -> 
         ("{APP}", app_str.as_str()),
         ("{tmp}", tmp_str.as_str()),
         ("{TMP}", tmp_str.as_str()),
+        ("{cmd}", cmd_exe.as_str()),
+        ("{CMD}", cmd_exe.as_str()),
         ("{userdocs}", docs_str.as_str()),
         ("{commondocs}", cdocs_str.as_str()),
         ("{userappdata}", appdata.as_str()),
